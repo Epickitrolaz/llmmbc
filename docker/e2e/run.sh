@@ -6,6 +6,9 @@
 #   * every node discovers the other three (broadcast or /24 subnet sweep),
 #   * `llmmbc_node chat ... --node http://node-c:47101` returns a non-empty answer,
 #   * GET /v1/session on the coordinator lists exactly node-a and node-b,
+#   * worker-mode toggle (issue #48): node-b restarted with LLMMBC_WORKER=0 is
+#     excluded from the next session (coordinator node-a, empty workerIds), and
+#     rejoins the session after being restored as a worker,
 #   * the same flow works for the MoE model granite3.1-moe:1b.
 #
 # On failure it prints container state and logs, and exits non-zero.
@@ -16,6 +19,7 @@ COMPOSE_FILE="${SCRIPT_DIR}/compose.yaml"
 export LLMMBC_E2E_CACHE="${LLMMBC_E2E_CACHE:-${SCRIPT_DIR}/.cache}"
 
 COMPOSE=(docker compose -f "${COMPOSE_FILE}" --project-name llmmbc-e2e)
+COMPOSE_OFF=(docker compose -f "${COMPOSE_FILE}" -f "${SCRIPT_DIR}/worker-off.yaml" --project-name llmmbc-e2e)
 NODE_SERVICES=(node-a node-b node-c node-d)
 DENSE_MODEL=qwen3:0.6b
 MOE_MODEL=granite3.1-moe:1b
@@ -77,6 +81,28 @@ node_id() { # node_id <service>
 
 session_json() { # session_json <service>
   "${COMPOSE[@]}" exec -T "$1" curl -fsS "http://127.0.0.1:47101/v1/session" | compact_json
+}
+
+node_info() { # node_info <service>
+  "${COMPOSE[@]}" exec -T "$1" curl -fsS "http://127.0.0.1:47101/v1/node" | compact_json
+}
+
+node_worker_enabled() { # node_worker_enabled <service> <true|false>
+  node_info "$1" | grep -qF "\"workerEnabled\":$2"
+}
+
+peer_worker_enabled() { # peer_worker_enabled <observer> <node-id> <true|false>
+  local observer=$1 id=$2 expected=$3 out prefix tail
+  out=$("${COMPOSE[@]}" exec -T "${observer}" curl -fsS "http://127.0.0.1:47101/v1/peers") || return 1
+  out=$(printf '%s' "${out}" | compact_json)
+  prefix="\"nodeId\":\"${id}\""
+  if [[ "${out}" != *"${prefix}"* ]]; then
+    return 1
+  fi
+  # NodeInfo.toJson() puts workerEnabled before the nested hardware object.
+  tail=${out#*"${prefix}"}
+  tail=${tail%%'"hardware"'*}
+  [[ "${tail}" == *"\"workerEnabled\":${expected}"* ]]
 }
 
 declare -A NODE_ID=()
@@ -208,6 +234,75 @@ assert_session_with_retry() { # assert_session_with_retry <model>
   fi
 }
 
+assert_no_worker_session() { # assert_no_worker_session <model>
+  local model=$1 json excluded
+  json=$(session_json node-a) || return 1
+  if grep -qF '"session":null' <<<"${json}"; then
+    printf '::error::node-a has no session after the client-only chat\n' >&2
+    return 1
+  fi
+  if ! grep -qF "\"coordinatorId\":\"${NODE_ID[node-a]}\"" <<<"${json}"; then
+    printf '::error::expected node-a to coordinate the worker-off session\n' >&2
+    return 1
+  fi
+  if ! grep -qF '"workerIds":[]' <<<"${json}"; then
+    printf '::error::expected an empty workerIds list while node-b is a non-worker\n' >&2
+    return 1
+  fi
+  if ! grep -qF "\"model\":\"${model}\"" <<<"${json}"; then
+    printf '::error::worker-off session does not report model %s\n' "${model}" >&2
+    return 1
+  fi
+  # Stronger than checking workerIds alone: no excluded node id may appear at
+  # all (issue #48 step 4); node-b must be absent, node-c/node-d never join.
+  for excluded in node-b node-c node-d; do
+    if grep -qF "${NODE_ID[${excluded}]}" <<<"${json}"; then
+      printf '::error::worker-off session wrongly contains excluded node %s\n' "${excluded}" >&2
+      return 1
+    fi
+  done
+  return 0
+}
+
+assert_no_worker_session_with_retry() { # assert_no_worker_session_with_retry <model>
+  local model=$1
+  log "GET /v1/session: node-a alone serves ${model} (node-b toggled off)"
+  if ! retry 120 "no-worker session for ${model}" assert_no_worker_session "${model}"; then
+    printf 'node-a session: %s\n' "$(session_json node-a || true)" >&2
+    die "expected a coordinator-only session without node-b for ${model}"
+  fi
+}
+
+wait_peer_worker() { # wait_peer_worker <observer> <service> <true|false>
+  local observer=$1 svc=$2 expected=$3
+  retry 300 "${observer} discovery of ${svc} (workerEnabled=${expected})" \
+    peer_worker_enabled "${observer}" "${NODE_ID[${svc}]}" "${expected}" \
+    || die "${observer} did not rediscover ${svc} with workerEnabled=${expected}"
+}
+
+toggle_node_b_worker() { # toggle_node_b_worker <0|1>
+  local enabled=$1 expected
+  if [[ "${enabled}" == "0" ]]; then
+    expected=false
+    log "Worker toggle: restarting node-b with LLMMBC_WORKER=0"
+    "${COMPOSE_OFF[@]}" up -d --no-deps --force-recreate node-b
+  else
+    expected=true
+    log "Worker toggle: restoring node-b as a worker"
+    "${COMPOSE[@]}" up -d --no-deps --force-recreate node-b
+  fi
+  retry 900 "node-b API after worker toggle" node_worker_enabled node-b "${expected}" \
+    || die "node-b did not report workerEnabled=${expected} after the toggle"
+  wait_peer_worker node-a node-b "${expected}"
+}
+
+restart_service() { # restart_service <service>
+  log "Restarting ${1} to clear the active session"
+  "${COMPOSE[@]}" restart --timeout 10 "$1"
+  "${COMPOSE[@]}" up -d --wait --wait-timeout 900 "$1"
+  wait_for_node_ids
+}
+
 restart_cluster() {
   log "Restarting the cluster to clear the active session"
   "${COMPOSE[@]}" down --remove-orphans --timeout 10
@@ -235,6 +330,24 @@ main() {
   wait_for_node_ids
   assert_peers
 
+  assert_chat "${DENSE_MODEL}"
+  assert_session_with_retry "${DENSE_MODEL}"
+
+  # Worker-mode toggle acceptance (issue #48). Clear the dense session first:
+  # the coordinator keeps it alive for 10 idle minutes and would otherwise keep
+  # using node-b's RPC worker while we flip node-b to non-worker.
+  restart_cluster
+  assert_peers
+
+  toggle_node_b_worker 0
+  assert_chat "${DENSE_MODEL}"
+  assert_no_worker_session_with_retry "${DENSE_MODEL}"
+
+  toggle_node_b_worker 1
+  # The coordinator-only session is still active on node-a; clear it so the next
+  # chat creates a fresh session that can include node-b again.
+  restart_service node-a
+  wait_peer_worker node-a node-b true
   assert_chat "${DENSE_MODEL}"
   assert_session_with_retry "${DENSE_MODEL}"
 
