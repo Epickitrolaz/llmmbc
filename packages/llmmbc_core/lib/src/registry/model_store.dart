@@ -449,7 +449,7 @@ class FileModelStore implements ModelStore {
         existing > 0 &&
         allowRetry) {
       // A stale or oversized .partial cannot be resumed: drop it and fetch from scratch.
-      await response.stream.drain<void>();
+      await _drainErrorBody(response, job, digest);
       await partial.delete();
       return _downloadLayer(
         job: job,
@@ -459,7 +459,7 @@ class FileModelStore implements ModelStore {
         allowRetry: false,
       );
     } else {
-      await response.stream.drain<void>();
+      await _drainErrorBody(response, job, digest);
       throw _PullFailure(
           'blob ${layer.digest} download failed with HTTP ${response.statusCode}');
     }
@@ -553,6 +553,52 @@ class FileModelStore implements ModelStore {
     if (await File(targetPath).exists()) await File(targetPath).delete();
     await partial.rename(targetPath);
     onProgress(received);
+  }
+
+  /// Drains a non-OK blob response body under the same idle timeout that guards the success
+  /// path. A registry that sends an error status and then stalls its body must not wedge the
+  /// pull (issue #26). Cancellation aborts the drain immediately.
+  Future<void> _drainErrorBody(http.StreamedResponse response, _PullJob job, String digest) async {
+    final completer = Completer<void>();
+    late StreamSubscription<List<int>> subscription;
+    Timer? timer;
+
+    void finish([Object? error]) {
+      timer?.cancel();
+      timer = null;
+      if (completer.isCompleted) return;
+      if (error == null) {
+        completer.complete();
+      } else {
+        completer.completeError(error);
+      }
+    }
+
+    subscription = response.stream.listen(
+      (_) {},
+      onDone: () => finish(),
+      onError: (Object error, StackTrace stackTrace) {
+        finish(job.cancelled ? const _Cancelled() : error);
+      },
+      cancelOnError: true,
+    );
+    timer = Timer(_requestTimeout, () {
+      unawaited(subscription.cancel());
+      finish(_PullFailure(
+          'blob $digest error response body stalled for ${_requestTimeout.inMilliseconds}ms'));
+    });
+
+    job.abort = () {
+      unawaited(subscription.cancel());
+      finish(const _Cancelled());
+    };
+
+    try {
+      await completer.future;
+    } finally {
+      timer?.cancel();
+      job.abort = null;
+    }
   }
 
   // -------------------------------------------------------------------------
