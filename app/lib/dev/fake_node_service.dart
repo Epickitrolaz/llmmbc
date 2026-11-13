@@ -46,6 +46,7 @@ class FakeNodeService implements NodeService {
     this.verifyDuration = const Duration(milliseconds: 1600),
     this.scanLatency = const Duration(milliseconds: 350),
     this.engineAvailable = true,
+    this.pullFailure,
   }) {
     _models = _FakeModelStore(this);
     _discovery = _FakeDiscovery(this);
@@ -89,6 +90,9 @@ class FakeNodeService implements NodeService {
 
   /// Simulates a build without engine binaries (worker still runs the node API).
   final bool engineAvailable;
+
+  /// When set, every pull fails with this error (tests and the error UX demo).
+  final Object? pullFailure;
 
   /// Set to throw from [chat] (tests and the error UX demo).
   Object? chatFailure;
@@ -508,6 +512,8 @@ class _FakeModelStore implements ModelStore {
 
   @override
   Stream<DownloadProgress> pull(ModelRef ref) {
+    final failure = _service.pullFailure;
+    if (failure != null) return Stream<DownloadProgress>.error(failure);
     final key = ref.toString();
     final local = localModels.where((model) => model.ref == ref).firstOrNull;
     if (local != null) {
