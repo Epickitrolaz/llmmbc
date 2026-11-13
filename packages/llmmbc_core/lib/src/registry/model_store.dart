@@ -45,6 +45,10 @@ class FileModelStore implements ModelStore {
   final String _registryBase;
   final Duration _requestTimeout;
   final Map<String, _PullJob> _jobs = {};
+  // In-flight blob work keyed by full digest. Blobs are content-addressed, so two pulls of
+  // different refs (or tags) that share a layer must share the download, not write the same
+  // `.partial` concurrently (#69).
+  final Map<String, Future<void>> _blobWork = {};
   final Map<String, _CachedMetadata> _metadataCache = {};
   bool _metadataLoaded = false;
 
@@ -488,6 +492,135 @@ class FileModelStore implements ModelStore {
     required _Layer layer,
     required int baseBytes,
     required int totalBytes,
+  }) async {
+    final key = layer.digest!.toLowerCase();
+    final target = File(_blobPath(layer.digest!));
+    final partial = File('${_blobPath(layer.digest!)}.partial');
+    // Different refs can share a content-addressed layer (e.g. `:latest` and `:1b`), so
+    // joining/owning is decided per digest, never per ref (#69).
+    for (var attempt = 0; attempt < 4; attempt++) {
+      final inFlight = _blobWork[key];
+      if (inFlight == null) {
+        final completer = Completer<void>();
+        final work = completer.future;
+        _blobWork[key] = work;
+        // Joiners await [work]; nobody may be listening when the pull is alone, so mark
+        // errors handled (the owner still receives them through its own await below).
+        work.ignore();
+        try {
+          await _downloadLayerOwned(
+            job: job,
+            ref: ref,
+            layer: layer,
+            baseBytes: baseBytes,
+            totalBytes: totalBytes,
+          );
+          if (!completer.isCompleted) completer.complete();
+        } catch (error, stackTrace) {
+          if (!completer.isCompleted) completer.completeError(error, stackTrace);
+          rethrow;
+        } finally {
+          if (identical(_blobWork[key], work)) _blobWork.remove(key);
+        }
+        return;
+      }
+      final promoted = await _joinBlobWork(
+        job: job,
+        work: inFlight,
+        partial: partial,
+        target: target,
+        baseBytes: baseBytes,
+        totalBytes: totalBytes,
+        expectedSize: layer.size,
+      );
+      if (promoted) {
+        job.transfer.reset(baseBytes + layer.size);
+        _reportDownloading(job, baseBytes + layer.size, totalBytes);
+        return;
+      }
+      if (job.cancelled) throw const _Cancelled();
+      // That owner failed (cancelled, network, timeout): try again, which joins whoever owns
+      // the digest now or becomes the owner ourselves.
+    }
+    throw _PullFailure('blob ${layer.digest}: concurrent downloads kept failing');
+  }
+
+  /// Makes [partial] the final content-addressed blob at [target].
+  ///
+  /// Promotion is idempotent: when another pull already promoted these exact bytes (two refs
+  /// can share a digest) the verified target is kept and the duplicate partial is dropped
+  /// instead of deleting a good blob or failing on a missing `.partial` (#69).
+  Future<void> _promotePartial(File partial, File target, int expectedSize) async {
+    Future<bool> targetIsGood() async =>
+        await target.exists() &&
+        (expectedSize <= 0 || await target.length() == expectedSize);
+    if (await targetIsGood()) {
+      if (await partial.exists()) await partial.delete();
+      return;
+    }
+    if (await target.exists()) await target.delete();
+    try {
+      await partial.rename(target.path);
+    } on FileSystemException {
+      // Someone else promoted (or consumed) the partial between our check and the rename.
+      if (await targetIsGood()) {
+        if (await partial.exists()) await partial.delete();
+        return;
+      }
+      rethrow;
+    }
+  }
+
+  /// Waits for another pull's in-flight download of the same digest, mirroring its progress
+  /// into this job and honouring cancellation. Returns true when the blob is complete.
+  Future<bool> _joinBlobWork({
+    required _PullJob job,
+    required Future<void> work,
+    required File partial,
+    required File target,
+    required int baseBytes,
+    required int totalBytes,
+    required int expectedSize,
+  }) async {
+    final cancelled = Completer<void>();
+    void onCancel() {
+      if (!cancelled.isCompleted) cancelled.complete();
+    }
+
+    job.abort = onCancel;
+    // Poll the partial so the waiting pull still shows progress (its own job is not the
+    // owner, so it gets no chunk callbacks).
+    final poller = Timer.periodic(const Duration(milliseconds: 250), (_) {
+      unawaited(() async {
+        try {
+          final length = await partial.length();
+          if (job.cancelled || length <= 0) return;
+          final effective = expectedSize > 0 && length > expectedSize ? expectedSize : length;
+          _reportDownloading(job, baseBytes + effective, totalBytes);
+        } catch (_) {
+          // The owner may have promoted the partial already.
+        }
+      }());
+    });
+    try {
+      await Future.any<void>([work, cancelled.future]);
+    } catch (_) {
+      // The owner failed; the caller retries as the new owner.
+    } finally {
+      poller.cancel();
+      job.abort = null;
+    }
+    if (job.cancelled) throw const _Cancelled();
+    return await target.exists() &&
+        (expectedSize <= 0 || await target.length() == expectedSize);
+  }
+
+  Future<void> _downloadLayerOwned({
+    required _PullJob job,
+    required ModelRef ref,
+    required _Layer layer,
+    required int baseBytes,
+    required int totalBytes,
     bool allowRetry = true,
   }) async {
     final digest = layer.digest!;
@@ -532,8 +665,7 @@ class FileModelStore implements ModelStore {
           // The partial is already the whole blob: verify and promote it without a request.
           final actual = await hasher.finish();
           if (layer.digestSha256 == null || actual == layer.digestSha256) {
-            if (await File(targetPath).exists()) await File(targetPath).delete();
-            await partial.rename(targetPath);
+            await _promotePartial(partial, File(targetPath), layer.size);
             job.transfer.reset(baseBytes + layer.size);
             onDownloadProgress(layer.size);
             return;
@@ -567,7 +699,7 @@ class FileModelStore implements ModelStore {
         await hasher?.abort();
         hasher = null;
         await partial.delete();
-        return await _downloadLayer(
+        return await _downloadLayerOwned(
           job: job,
           ref: ref,
           layer: layer,
@@ -726,8 +858,7 @@ class FileModelStore implements ModelStore {
         await partial.delete();
         throw _PullFailure('blob $digest failed sha256 verification');
       }
-      if (await File(targetPath).exists()) await File(targetPath).delete();
-      await partial.rename(targetPath);
+      await _promotePartial(partial, File(targetPath), layer.size);
       onDownloadProgress(received);
     } finally {
       // Idempotent cleanup: release the background isolate on success, failure or cancel.
@@ -1204,6 +1335,11 @@ class _BackgroundHasher {
         if (hasher.outstandingBytes <= lowWaterBytes) hasher.onDrained?.call();
       } else if (kind == 'digest') {
         if (!hasher._digest.isCompleted) hasher._digest.complete(message[1] as String);
+      } else if (kind == 'cancelled') {
+        // The worker acknowledged the cancel. `abort()` must not depend on the isolate
+        // actually exiting: with a VM service attached (every debug build) the exit
+        // completion can be arbitrarily late, which used to wedge cancellations (#68).
+        if (!hasher._digest.isCompleted) hasher._digest.complete('');
       } else if (kind == 'error') {
         final error = StateError('hash worker: ${message[1]}');
         if (!hasher._ready.isCompleted) hasher._ready.completeError(error);
@@ -1286,9 +1422,12 @@ class _BackgroundHasher {
     _finished = true;
     _commands?.send('cancel');
     try {
-      await _digest.future;
+      // The worker answers with an explicit `cancelled` message; the watchdog only covers a
+      // worker that died without acknowledging, so a terminal pull event never waits on
+      // isolate exit (which a VM service can delay indefinitely, see #68).
+      await _digest.future.timeout(const Duration(seconds: 2));
     } catch (_) {
-      // The worker may already have died; nothing left to clean up.
+      // The worker may already have died (or be paused by a debugger): nothing to clean up.
     } finally {
       _events.close();
     }

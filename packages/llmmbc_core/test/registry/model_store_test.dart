@@ -403,6 +403,78 @@ void main() {
     expect(registry.blobRequestCounts[_hex(gguf)], 1);
   });
 
+  test('concurrent pulls of different refs sharing a blob do not race (#69)', () async {
+    // `:latest` and `:1b` point at the same model bytes, and the small template layer too.
+    final gguf = denseFixture().build();
+    final shared = _bytes('{{ .Prompt }}');
+    registry.addModel('library', 'taga', 'latest', {
+      _configMedia: _bytes('{"a":1}'),
+      _modelMedia: gguf,
+      _templateMedia: shared,
+    });
+    registry.addModel('library', 'tagb', '1b', {
+      _configMedia: _bytes('{"b":2}'),
+      _modelMedia: gguf,
+      _templateMedia: shared,
+    });
+    // Make the two downloads overlap for the whole body.
+    registry.chunkSize = 64 * 1024;
+    registry.chunkDelay = const Duration(milliseconds: 2);
+
+    final refA = ModelRef.parse('taga:latest');
+    final refB = ModelRef.parse('tagb:1b');
+    final a = store.pull(refA).toList();
+    final b = Future<void>.delayed(const Duration(milliseconds: 5)).then((_) => store.pull(refB).toList());
+    final results = await Future.wait([a, b]);
+
+    expect(results[0].last.state, DownloadState.done, reason: '${results[0].last.error}');
+    expect(results[1].last.state, DownloadState.done, reason: '${results[1].last.error}');
+    expect(results[0].last.error, isNull);
+    expect(results[1].last.error, isNull);
+
+    // The shared blob exists once, byte-identical, and both models are listed.
+    final blob = File(blobPath(_hex(gguf)));
+    expect(await blob.exists(), isTrue);
+    expect(await blob.readAsBytes(), gguf);
+    expect(await File('${blobPath(_hex(gguf))}.partial').exists(), isFalse);
+    final refs = (await store.list()).map((model) => model.ref).toSet();
+    expect(refs, containsAll([refA, refB]));
+
+    // One body download, not two: the second pull joined the in-flight digest.
+    expect(registry.blobRequestCounts[_hex(gguf)], 1);
+  });
+
+  test('a pull joining a shared blob can be cancelled without stopping the owner (#69)', () async {
+    final gguf = denseFixture().build();
+    registry.addModel('library', 'taga', 'latest', {_modelMedia: gguf});
+    registry.addModel('library', 'tagb', '1b', {_modelMedia: gguf});
+    registry.chunkSize = 64 * 1024;
+    registry.chunkDelay = const Duration(milliseconds: 3);
+
+    final refA = ModelRef.parse('taga:latest');
+    final refB = ModelRef.parse('tagb:1b');
+    final owner = store.pull(refA).map((event) => event.state).toList();
+    // Let the first pull own the digest, then cancel the one that joins it.
+    await Future<void>.delayed(const Duration(milliseconds: 30));
+
+    final joinerStates = <DownloadState>[];
+    final watch = Stopwatch()..start();
+    await for (final progress in store.pull(refB)) {
+      joinerStates.add(progress.state);
+      if (progress.state == DownloadState.downloading) {
+        await store.cancel(refB).timeout(const Duration(seconds: 2));
+      }
+    }
+    watch.stop();
+
+    expect(joinerStates.last, DownloadState.cancelled);
+    expect(watch.elapsed, lessThan(const Duration(seconds: 2)),
+        reason: 'a joining pull must cancel promptly');
+    expect((await owner).last, DownloadState.done,
+        reason: 'cancelling the joiner must not stop the owner');
+    expect(await File(blobPath(_hex(gguf))).readAsBytes(), gguf);
+  });
+
   test('throttles progress events to at most ten per second', () async {
     final gguf = denseFixture().build();
     registry.addModel('library', 'qwen3', '0.6b', {
