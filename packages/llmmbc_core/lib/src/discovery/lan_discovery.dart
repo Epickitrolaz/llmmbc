@@ -602,6 +602,13 @@ class LanDiscovery implements Discovery {
   List<String> debugBroadcastTargets() => _broadcastTargets();
 
   @visibleForTesting
+  Map<String, dynamic> debugBeaconPayload() {
+    final self = _self?.call();
+    if (self == null) throw StateError('discovery not started');
+    return _beaconPayload(self);
+  }
+
+  @visibleForTesting
   bool get debugHasDefaultRoute => _hasDefaultRoute;
 
   void _onSocketError(Object error) {
@@ -621,17 +628,22 @@ class LanDiscovery implements Discovery {
     }
   }
 
+  Map<String, dynamic> _beaconPayload(NodeInfo self) => {
+        't': 'llmmbc.beacon',
+        'v': kProtocolVersion,
+        'id': self.nodeId,
+        'name': self.name,
+        'port': self.apiPort,
+        // Advertised budget (§2.5); additive, older peers ignore it and fall
+        // back to `GET /v1/node`.
+        'memoryBudgetBytes': self.memoryBudgetBytes,
+      };
+
   void _sendBeacon() {
     final self = _self?.call();
     final socket = _socket;
     if (self == null || socket == null) return;
-    final payload = utf8.encode(jsonEncode({
-      't': 'llmmbc.beacon',
-      'v': kProtocolVersion,
-      'id': self.nodeId,
-      'name': self.name,
-      'port': self.apiPort,
-    }));
+    final payload = utf8.encode(jsonEncode(_beaconPayload(self)));
     _sendToNetwork(socket, payload);
   }
 
@@ -651,13 +663,7 @@ class LanDiscovery implements Discovery {
     final self = _self?.call();
     final socket = _socket;
     if (self == null || socket == null) return;
-    final payload = utf8.encode(jsonEncode({
-      't': 'llmmbc.beacon',
-      'v': kProtocolVersion,
-      'id': self.nodeId,
-      'name': self.name,
-      'port': self.apiPort,
-    }));
+    final payload = utf8.encode(jsonEncode(_beaconPayload(self)));
     try {
       socket.send(payload, address, port);
     } catch (_) {

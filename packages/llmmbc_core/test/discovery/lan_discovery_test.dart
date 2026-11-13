@@ -59,6 +59,22 @@ void main() {
     await sub.cancel();
   });
 
+  test('beacons advertise the memory budget (§2.5)', () async {
+    final info = nodeInfo('a', apiPort: 48111, memoryBudgetBytes: 7 << 30);
+    final discovery =
+        LanDiscovery(client: FakeNodeClient(), sweepEnabled: false);
+    addTearDown(discovery.stop);
+    await discovery.start(
+      () => info,
+      NodeSettings(nodeId: 'a', name: 'a', dataDir: '/tmp/a', apiPort: 48111),
+    );
+    final beacon = discovery.debugBeaconPayload();
+    expect(beacon['t'], 'llmmbc.beacon');
+    expect(beacon['id'], 'a');
+    expect(beacon['port'], 48111);
+    expect(beacon['memoryBudgetBytes'], 7 << 30);
+  });
+
   test('sweep finds a node served by a local HttpServer', () async {
     final interfaces = await NetworkInterface.list(
         type: InternetAddressType.IPv4, includeLoopback: false);

@@ -40,6 +40,7 @@ NodeInfo nodeInfo(
   NodeStatus status = NodeStatus.idle,
   bool reachable = true,
   bool isSelf = false,
+  int memoryBudgetBytes = 0,
 }) =>
     NodeInfo(
       nodeId: id,
@@ -51,6 +52,7 @@ NodeInfo nodeInfo(
       status: status,
       hardware: hardware ?? hw(),
       models: models,
+      memoryBudgetBytes: memoryBudgetBytes,
       reachable: reachable,
       isSelf: isSelf,
     );
