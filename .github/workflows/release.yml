@@ -27,7 +27,7 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
       prerelease: ${{ steps.version.outputs.prerelease }}
       has_engine: ${{ steps.version.outputs.has_engine }}
-      has_cli: ${{ steps.version.outputs.has_cli }}
+      has_core: ${{ steps.version.outputs.has_core }}
       has_app: ${{ steps.version.outputs.has_app }}
     steps:
       - uses: actions/checkout@v4
@@ -54,10 +54,52 @@ jobs:
             echo "tag=${tag}"
             echo "prerelease=${prerelease}"
             echo "has_engine=$([ -f scripts/fetch_engine.sh ] && echo true || echo false)"
-            echo "has_cli=$([ -f packages/llmmbc_core/bin/llmmbc_node.dart ] && echo true || echo false)"
+            echo "has_core=$([ -f packages/llmmbc_core/pubspec.yaml ] && echo true || echo false)"
             echo "has_app=$([ -f app/pubspec.yaml ] && echo true || echo false)"
           } >> "$GITHUB_OUTPUT"
           echo "Release tag: ${tag} (prerelease=${prerelease})"
+
+  # ---------------------------------------------------------------------------
+  # A file-existence check is not enough: bin/llmmbc_node.dart exists on main as
+  # a contract stub that only throws. Every CLI/image/E2E job is gated on this
+  # smoke test actually producing HardwareProfile JSON.
+  # ---------------------------------------------------------------------------
+  cli-smoke:
+    name: CLI smoke test
+    needs: meta
+    if: needs.meta.outputs.has_core == 'true'
+    runs-on: ubuntu-24.04
+    outputs:
+      working: ${{ steps.smoke.outputs.working }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+      - name: Smoke-test llmmbc_node hw
+        id: smoke
+        shell: bash
+        working-directory: packages/llmmbc_core
+        run: |
+          set -euo pipefail
+          if [ ! -f bin/llmmbc_node.dart ]; then
+            echo "working=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Headless CLI missing; skipping CLI, Docker and release publication"
+            exit 0
+          fi
+          dart pub get
+          if ! out=$(dart run bin/llmmbc_node.dart hw); then
+            echo "working=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::llmmbc_node is not functional yet (hw exited non-zero); skipping CLI, Docker and release publication"
+            exit 0
+          fi
+          printf '%s\n' "${out}"
+          if [[ "${out}" != \{* ]] || ! grep -q '"totalRamBytes"' <<<"${out}"; then
+            echo "working=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::llmmbc_node hw did not print HardwareProfile JSON; skipping CLI, Docker and release publication"
+            exit 0
+          fi
+          echo "working=true" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
   # llama.cpp engine binaries, one job per target. Cached by LLAMA_CPP_VERSION.
@@ -141,8 +183,8 @@ jobs:
   # ---------------------------------------------------------------------------
   cli:
     name: Node CLI ${{ matrix.target }}
-    needs: [meta, engine]
-    if: needs.meta.outputs.has_cli == 'true' && needs.meta.outputs.has_engine == 'true'
+    needs: [meta, engine, cli-smoke]
+    if: needs.meta.outputs.has_engine == 'true' && needs.cli-smoke.outputs.working == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -255,6 +297,16 @@ jobs:
           }
           copy_engine engine/android-arm64 arm64-v8a
           copy_engine engine/android-x64 x86_64
+          for abi in arm64-v8a x86_64; do
+            dst="app/android/app/src/main/jniLibs/${abi}"
+            for lib in libllama_server.so librpc_server.so; do
+              if [ ! -f "${dst}/${lib}" ]; then
+                echo "::error::Missing ${lib} for ${abi} after engine install"
+                ls -la "${dst}" || true
+                exit 1
+              fi
+            done
+          done
       - name: Build release APK (debug-signed when no keystore secret is configured)
         working-directory: app
         run: |
@@ -302,6 +354,12 @@ jobs:
           bundle=app/build/linux/x64/release/bundle
           mkdir -p "${bundle}/engine"
           cp -a engine-dist/. "${bundle}/engine/"
+          for bin in llama-server rpc-server; do
+            if [ ! -x "${bundle}/engine/${bin}" ]; then
+              echo "::error::Missing executable engine/${bin} in the Linux bundle"
+              exit 1
+            fi
+          done
           tar -czf llmmbc-app-linux-x64.tar.gz -C "${bundle}" .
       - uses: actions/upload-artifact@v4
         with:
@@ -337,6 +395,9 @@ jobs:
           $bundle = "app/build/windows/x64/runner/Release"
           New-Item -ItemType Directory -Force -Path "$bundle/engine" | Out-Null
           Copy-Item "engine-dist/*" "$bundle/engine/" -Recurse
+          foreach ($bin in @("llama-server.exe", "rpc-server.exe")) {
+            if (-not (Test-Path "$bundle/engine/$bin")) { throw "Missing engine/$bin in the Windows bundle" }
+          }
           Compress-Archive -Path "$bundle/*" -DestinationPath "llmmbc-app-windows-x64.zip"
       - uses: actions/upload-artifact@v4
         with:
@@ -377,6 +438,12 @@ jobs:
           fi
           mkdir -p "${app}/Contents/MacOS/engine"
           cp -a engine-dist/. "${app}/Contents/MacOS/engine/"
+          for bin in llama-server rpc-server; do
+            if [ ! -x "${app}/Contents/MacOS/engine/${bin}" ]; then
+              echo "::error::Missing executable Contents/MacOS/engine/${bin} in the macOS bundle"
+              exit 1
+            fi
+          done
           ditto -c -k --keepParent "${app}" llmmbc-app-macos-arm64.zip
       - uses: actions/upload-artifact@v4
         with:
@@ -412,7 +479,7 @@ jobs:
             echo "::error::No iOS .app bundle produced"
             exit 1
           fi
-          zip -qry llmmbc-ios-unsigned.zip "${app}"
+          ditto -c -k --keepParent "${app}" llmmbc-ios-unsigned.zip
       - uses: actions/upload-artifact@v4
         with:
           name: llmmbc-app-ios-unsigned
@@ -425,8 +492,8 @@ jobs:
   # ---------------------------------------------------------------------------
   docker:
     name: Docker image (GHCR)
-    needs: meta
-    if: needs.meta.outputs.has_engine == 'true' && needs.meta.outputs.has_cli == 'true'
+    needs: [meta, cli-smoke]
+    if: needs.meta.outputs.has_engine == 'true' && needs.cli-smoke.outputs.working == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -460,9 +527,12 @@ jobs:
   # ---------------------------------------------------------------------------
   release:
     name: Publish GitHub Release
-    needs: [meta, engine, cli, app-android, app-linux, app-windows, app-macos, app-ios, docker]
-    # Only publish once the headless CLI artifacts exist; skipped/slow app jobs do not block it.
-    if: always() && needs.meta.result == 'success' && needs.cli.result == 'success'
+    needs: [meta, cli-smoke, engine, cli, app-android, app-linux, app-windows, app-macos, app-ios, docker]
+    # Only publish a working, smoke-tested CLI; skipped/slow app jobs do not block it.
+    if: >-
+      always() && needs.meta.result == 'success' &&
+      needs.cli-smoke.result == 'success' && needs.cli-smoke.outputs.working == 'true' &&
+      needs.cli.result == 'success'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4

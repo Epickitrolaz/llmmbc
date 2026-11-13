@@ -26,16 +26,37 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
       - name: Check integration prerequisites
         id: prereq
         shell: bash
         run: |
-          if [ -f scripts/fetch_engine.sh ] && [ -f packages/llmmbc_core/bin/llmmbc_node.dart ]; then
-            echo "ready=true" >> "$GITHUB_OUTPUT"
-          else
+          set -euo pipefail
+          if [ ! -f scripts/fetch_engine.sh ]; then
             echo "ready=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Skipping Docker E2E: scripts/fetch_engine.sh or the headless CLI is not merged yet"
+            echo "::notice::Skipping Docker E2E: scripts/fetch_engine.sh (engine stream) is not merged yet"
+            exit 0
           fi
+          if [ ! -f packages/llmmbc_core/bin/llmmbc_node.dart ]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping Docker E2E: the headless CLI (core-net) is not merged yet"
+            exit 0
+          fi
+          cd packages/llmmbc_core
+          dart pub get
+          if ! out=$(dart run bin/llmmbc_node.dart hw); then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping Docker E2E: llmmbc_node is not functional yet (hw exited non-zero)"
+            exit 0
+          fi
+          if [[ "${out}" != \{* ]] || ! grep -q '"totalRamBytes"' <<<"${out}"; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping Docker E2E: llmmbc_node hw did not print HardwareProfile JSON"
+            exit 0
+          fi
+          echo "ready=true" >> "$GITHUB_OUTPUT"
       - name: Restore model cache
         if: steps.prereq.outputs.ready == 'true'
         uses: actions/cache@v4

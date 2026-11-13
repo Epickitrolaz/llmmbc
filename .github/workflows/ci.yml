@@ -33,7 +33,7 @@ jobs:
             echo "core=$([ -f packages/llmmbc_core/pubspec.yaml ] && echo true || echo false)"
             echo "app=$([ -f app/pubspec.yaml ] && echo true || echo false)"
             echo "scripts=$(compgen -G 'scripts/*.sh' >/dev/null && echo true || echo false)"
-            echo "docker_scripts=$(compgen -G 'docker/**/*.sh' >/dev/null && echo true || echo false)"
+            echo "docker_scripts=$([ -n "$(find docker -name '*.sh' -print -quit 2>/dev/null)" ] && echo true || echo false)"
           } >> "$GITHUB_OUTPUT"
 
   core-dart:
@@ -96,7 +96,7 @@ jobs:
         run: shellcheck -x scripts/*.sh
       - name: shellcheck docker/**/*.sh
         if: needs.prereq.outputs.docker_scripts == 'true'
-        run: shellcheck -x docker/e2e/*.sh
+        run: find docker -name '*.sh' -exec shellcheck -x {} +
 
   actionlint:
     name: actionlint
