@@ -108,7 +108,12 @@ class ModelRef {
       rest = rest.substring(0, colon);
     }
     final parts = rest.split('/');
-    if (parts.length > 2 || parts.any((p) => p.isEmpty) || tag.isEmpty || parts.first.contains('.')) {
+    // Dots are fine in names (`llama3.2`, `granite3.1-moe`) but a dotted namespace is a
+    // registry host (`hf.co/...`), which is not supported.
+    if (parts.length > 2 ||
+        parts.any((p) => p.isEmpty) ||
+        tag.isEmpty ||
+        (parts.length == 2 && parts.first.contains('.'))) {
       throw FormatException('bad model ref', s);
     }
     return parts.length == 2

@@ -7,6 +7,9 @@ void main() {
     expect(ModelRef.parse('library/qwen3').toString(), 'qwen3:latest');
     expect(ModelRef.parse('foo/bar:1b').namespace, 'foo');
     expect(() => ModelRef.parse('hf.co/x/y'), throwsFormatException);
+    expect(() => ModelRef.parse('hf.co/x'), throwsFormatException);
+    expect(ModelRef.parse('llama3.2:1b').toString(), 'llama3.2:1b');
+    expect(ModelRef.parse('granite3.1-moe:1b').name, 'granite3.1-moe');
   });
 
   test('candidate rule (§2.2) and NodeInfo JSON round-trip', () {
