@@ -5,6 +5,8 @@ import 'dart:io';
 
 import 'package:args/args.dart';
 import 'package:llmmbc_core/llmmbc_core.dart';
+import 'package:llmmbc_core/src/node/cli_memory.dart';
+import 'package:llmmbc_core/src/node/cli_progress.dart';
 import 'package:path/path.dart' as p;
 
 const String _kDefaultNode = 'http://127.0.0.1:47101';
@@ -19,7 +21,13 @@ Future<void> main(List<String> args) async {
     ..addFlag('no-worker',
         negatable: false, help: 'Do not lend compute to sessions')
     ..addMultiOption('peer', help: 'Manual peer host:port', splitCommas: true)
-    ..addOption('port', defaultsTo: '$kNodeApiPort', help: 'Node API port');
+    ..addOption('port', defaultsTo: '$kNodeApiPort', help: 'Node API port')
+    ..addOption('memory-basis',
+        allowed: ['total', 'available'],
+        help: 'Memory the budget is based on (env LLMMBC_MEMORY_BASIS)')
+    ..addOption('memory-share',
+        help: 'Fraction (0..1] of that memory lent to sessions '
+            '(env LLMMBC_MEMORY_SHARE, default $kDefaultMemoryShare)');
 
   parser.addCommand('pull').addOption('data-dir', help: 'Data directory');
 
@@ -112,6 +120,17 @@ Future<void> _serve(ArgResults command) async {
   final env = Platform.environment;
   final settingsPath = p.join(dataDir, 'settings.json');
 
+  final MemoryOptions memory;
+  try {
+    memory = parseMemoryOptions(
+      basisFlag: command['memory-basis'] as String?,
+      shareFlag: command['memory-share'] as String?,
+      environment: env,
+    );
+  } on FormatException catch (e) {
+    throw LlmmbcException('bad_request', e.message);
+  }
+
   final service = await LocalNodeService.create(
     settingsPath: settingsPath,
     defaultDataDir: dataDir,
@@ -141,6 +160,8 @@ Future<void> _serve(ArgResults command) async {
         .where((e) => e.isNotEmpty)),
   };
   settings = settings.copyWith(manualPeers: peers.toList());
+  settings =
+      settings.copyWith(memoryBasis: memory.basis, memoryShare: memory.share);
   await service.updateSettings(settings);
 
   final phases = service.startupPhase.listen((phase) {
@@ -155,6 +176,10 @@ Future<void> _serve(ArgResults command) async {
   stdout.writeln(
       'worker: ${service.self.workerEnabled ? "enabled" : "disabled"}  '
       'engine: ${service.self.engineAvailable ? "available" : "unavailable"}');
+  stdout.writeln('memory budget: '
+      '${formatByteSize(service.self.memoryBudgetBytes)} '
+      '(basis ${service.settings.memoryBasis.name}, '
+      'share ${service.settings.memoryShare.toStringAsFixed(2)})');
   stdout.writeln('peers: ${service.discovery.peers.length}');
 
   final changed = service.changed.listen((_) {
@@ -199,22 +224,40 @@ Future<void> _pull(ArgResults command) async {
   }
   final ref = ModelRef.parse(command.rest.first);
   final store = FileModelStore(_dataDir(command));
-  var last = -1;
+  final stopwatch = Stopwatch()..start();
+  final printer = PullProgressPrinter(
+    write: stdout.write,
+    isTty: stdoutIsTty(),
+  );
+  DownloadProgress? completed;
   await for (final progress in store.pull(ref)) {
-    final pct = (progress.fraction * 100).floor();
-    if (pct != last || progress.state != DownloadState.downloading) {
-      last = pct;
-      stdout.writeln(
-          '${progress.state.name} $pct% ${progress.receivedBytes}/${progress.totalBytes}');
-    }
-    if (progress.state == DownloadState.failed) {
-      throw LlmmbcException('internal', progress.error ?? 'download failed');
-    }
-    if (progress.state == DownloadState.cancelled) {
-      exitCode = 1;
-      return;
+    switch (progress.state) {
+      case DownloadState.failed:
+        printer.finish(formatPullProgress(progress));
+        throw LlmmbcException('internal', progress.error ?? 'download failed');
+      case DownloadState.cancelled:
+        printer.finish(formatPullProgress(progress));
+        exitCode = 1;
+        return;
+      case DownloadState.done:
+        completed = progress;
+      case DownloadState.queued:
+      case DownloadState.resolving:
+      case DownloadState.downloading:
+      case DownloadState.verifying:
+        printer.update(progress);
     }
   }
+  stopwatch.stop();
+  var totalBytes = completed?.totalBytes ?? 0;
+  if (totalBytes <= 0) {
+    totalBytes = (await store.find(ref))?.sizeBytes ?? 0;
+  }
+  printer.finish(formatPullSummary(
+    ref: ref,
+    totalBytes: totalBytes,
+    elapsed: stopwatch.elapsed,
+  ));
 }
 
 Future<void> _list(ArgResults command) async {
@@ -243,6 +286,13 @@ Future<void> _rm(ArgResults command) async {
 Future<void> _hw() async {
   final profile = await LocalHardwareProbe().scan();
   stdout.writeln(const JsonEncoder.withIndent('  ').convert(profile.toJson()));
+  final share = memoryShareFromEnvironment(Platform.environment);
+  stdout.writeln('memory budget (share ${share.toStringAsFixed(2)}):');
+  for (final basis in MemoryBasis.values) {
+    final budget = profile.memoryBudgetBytes(basis, share);
+    stdout.writeln('  ${basis.name.padRight(9)} '
+        '${formatByteSize(budget)} ($budget bytes)');
+  }
 }
 
 Future<void> _peers(ArgResults command) async {

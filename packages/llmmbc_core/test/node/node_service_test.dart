@@ -39,6 +39,8 @@ Harness buildHarness({
   bool workerEnabled = true,
   Duration idle = kSessionIdleTimeout,
   Duration modelRefreshInterval = const Duration(seconds: 10),
+  double memoryShare = kDefaultMemoryShare,
+  MemoryBasis memoryBasis = MemoryBasis.total,
   FakeEngine? engine,
   FakePlanner? planner,
   FakeNodeClient? client,
@@ -60,6 +62,8 @@ Harness buildHarness({
     dataDir: dir.path,
     apiPort: 0,
     workerEnabled: workerEnabled,
+    memoryShare: memoryShare,
+    memoryBasis: memoryBasis,
   );
   final fakeEngine = engine ?? FakeEngine();
   final fakePlanner = planner ?? FakePlanner();
@@ -272,6 +276,180 @@ void main() {
       } finally {
         client.close();
       }
+    });
+  });
+
+  group('memory budget (§2.5)', () {
+    test('defaults to total basis and advertises the budget in NodeInfo',
+        () async {
+      final hardware = hw(total: 16 << 30, available: 4 << 30);
+      final h =
+          buildHarness(hardware: hardware, models: [localModel('qwen3:0.6b')]);
+      await h.service.start();
+      final expected =
+          hardware.memoryBudgetBytes(MemoryBasis.total, kDefaultMemoryShare);
+      expect(expected, ((16 << 30) * kDefaultMemoryShare).floor());
+      expect(h.service.self.memoryBudgetBytes, expected);
+
+      final client = HttpNodeClient();
+      addTearDown(client.close);
+      final info = await client.info(
+          Uri(scheme: 'http', host: '127.0.0.1', port: h.service.self.apiPort));
+      expect(info.memoryBudgetBytes, expected);
+      expect(info.effectiveBudgetBytes, expected);
+    });
+
+    test('available basis advertises a smaller budget and rpc/start returns it',
+        () async {
+      final hardware = hw(total: 16 << 30, available: 4 << 30);
+      final h = buildHarness(
+        hardware: hardware,
+        models: [localModel('qwen3:0.6b')],
+        memoryBasis: MemoryBasis.available,
+        memoryShare: 0.5,
+      );
+      await h.service.start();
+      final expected = hardware.memoryBudgetBytes(MemoryBasis.available, 0.5);
+      expect(h.service.self.memoryBudgetBytes, expected);
+      expect(expected,
+          lessThan(hardware.memoryBudgetBytes(MemoryBasis.total, 0.5)));
+
+      final result = await h.service.handleRpcStart(
+        sessionId: 's1',
+        model: ModelRef.parse('qwen3:0.6b'),
+        coordinatorId: 'c',
+      );
+      expect(result.budgetBytes, expected);
+    });
+
+    test('the coordinator plan uses its own advertised budget', () async {
+      final hardware = hw(total: 16 << 30, available: 4 << 30);
+      final h =
+          buildHarness(hardware: hardware, models: [localModel('qwen3:0.6b')]);
+      await h.service.start();
+      await h.service.chat(ModelRef.parse('qwen3:0.6b'),
+          [const ChatMessage('user', 'hi')]).toList();
+      final plan = h.engine.lastPlan;
+      expect(plan, isNotNull);
+      expect(plan!.nodes.single.nodeId, 'self');
+      expect(plan.nodes.single.budgetBytes, h.service.self.memoryBudgetBytes);
+    });
+
+    test('prefers the largest advertised budget over raw hardware', () async {
+      final h = buildHarness(
+        hardware: hw(total: 16 << 30, available: 4 << 30),
+        models: [localModel('qwen3:0.6b')],
+        peers: [
+          // Small machine that lends a lot by configuration.
+          nodeInfo('advertised',
+              apiPort: 50001,
+              models: [localModel('qwen3:0.6b')],
+              hardware: hw(total: 8 << 30, available: 1 << 30),
+              memoryBudgetBytes: 32 << 30),
+          // Larger machine without an advertised budget (older peer).
+          nodeInfo('legacy',
+              apiPort: 50002,
+              models: [localModel('qwen3:0.6b')],
+              hardware: hw(total: 64 << 30, available: 32 << 30)),
+        ],
+      );
+      await h.service.start();
+      await h.service.chat(ModelRef.parse('qwen3:0.6b'),
+          [const ChatMessage('user', 'hi')]).toList();
+      expect(h.client.chatBases.single.port, 50001);
+    });
+
+    test('falls back to usable memory for peers without a budget', () async {
+      final h = buildHarness(
+        hardware: hw(total: 16 << 30, available: 4 << 30),
+        models: [localModel('qwen3:0.6b')],
+        peers: [
+          nodeInfo('advertised',
+              apiPort: 50001,
+              models: [localModel('qwen3:0.6b')],
+              hardware: hw(total: 2 << 30, available: 1 << 30),
+              memoryBudgetBytes: 30 << 30),
+          nodeInfo('legacy',
+              apiPort: 50002,
+              models: [localModel('qwen3:0.6b')],
+              hardware: hw(total: 64 << 30, available: 32 << 30)),
+        ],
+      );
+      await h.service.start();
+      await h.service.chat(ModelRef.parse('qwen3:0.6b'),
+          [const ChatMessage('user', 'hi')]).toList();
+      expect(h.client.chatBases.single.port, 50002);
+    });
+
+    test('clusterModels orders candidates by effective budget', () async {
+      final h = buildHarness(
+        hardware: hw(total: 8 << 30, available: 1 << 30),
+        models: [localModel('qwen3:0.6b')],
+        peers: [
+          nodeInfo('legacy',
+              apiPort: 50001,
+              models: [localModel('qwen3:0.6b')],
+              hardware: hw(total: 64 << 30, available: 32 << 30)),
+          nodeInfo('advertised',
+              apiPort: 50002,
+              models: [localModel('qwen3:0.6b')],
+              hardware: hw(total: 2 << 30, available: 1 << 30),
+              memoryBudgetBytes: 48 << 30),
+        ],
+      );
+      await h.service.start();
+      final cluster = h.service.clusterModels();
+      expect(cluster.single.candidates.map((c) => c.nodeId),
+          ['advertised', 'legacy', 'self']);
+    });
+
+    test('updateSettings recomputes the budget and emits changed', () async {
+      final hardware = hw(total: 16 << 30, available: 4 << 30);
+      final h =
+          buildHarness(hardware: hardware, models: [localModel('qwen3:0.6b')]);
+      await h.service.start();
+      final before = h.service.self.memoryBudgetBytes;
+      final events = <void>[];
+      final sub = h.service.changed.listen(events.add);
+      await h.service.updateSettings(h.service.settings
+          .copyWith(memoryBasis: MemoryBasis.available, memoryShare: 0.5));
+      await Future<void>.delayed(Duration.zero);
+      expect(h.service.self.memoryBudgetBytes,
+          hardware.memoryBudgetBytes(MemoryBasis.available, 0.5));
+      expect(h.service.self.memoryBudgetBytes, lessThan(before));
+      expect(events, isNotEmpty);
+      await sub.cancel();
+    });
+
+    test('migrates a v1 settings file and rewrites it on first start',
+        () async {
+      final dir = Directory.systemTemp.createTempSync('llmmbc_migration_test');
+      addTearDown(() {
+        try {
+          dir.deleteSync(recursive: true);
+        } on FileSystemException {
+          // ignore
+        }
+      });
+      final path = '${dir.path}/settings.json';
+      File(path).writeAsStringSync(jsonEncode({
+        'nodeId': 'legacy-node',
+        'name': 'legacy',
+        'dataDir': dir.path,
+        'workerEnabled': false,
+        'memoryShare': 0.8,
+      }));
+      final service = await LocalNodeService.create(
+          settingsPath: path, defaultDataDir: dir.path);
+      addTearDown(service.stop);
+      expect(service.settings.memoryShare, kDefaultMemoryShare);
+      expect(service.settings.memoryBasis, MemoryBasis.total);
+      expect(service.settings.workerEnabled, isFalse);
+      final persisted =
+          jsonDecode(File(path).readAsStringSync()) as Map<String, dynamic>;
+      expect(persisted['settingsVersion'], kSettingsVersion);
+      expect(persisted['memoryBasis'], 'total');
+      expect((persisted['memoryShare'] as num).toDouble(), kDefaultMemoryShare);
     });
   });
 

@@ -283,6 +283,7 @@ class LocalNodeService implements NodeService {
       status: _status,
       hardware: _hardware,
       models: List<LocalModel>.unmodifiable(_localModels),
+      memoryBudgetBytes: _budgetBytes(),
       reachable: true,
       isSelf: true,
       lastSeen: _now(),
@@ -464,7 +465,14 @@ class LocalNodeService implements NodeService {
 
     final result = <ClusterModel>[];
     accumulator.forEach((ref, acc) {
-      final candidates = acc.nodes.where((n) => n.isCandidateFor(ref)).toList();
+      final candidates = acc.nodes.where((n) => n.isCandidateFor(ref)).toList()
+        ..sort((a, b) {
+          // Best coordinator first (§2.3/§2.5); works for older peers without
+          // an advertised budget through `effectiveBudgetBytes`.
+          final byBudget =
+              b.effectiveBudgetBytes.compareTo(a.effectiveBudgetBytes);
+          return byBudget != 0 ? byBudget : a.nodeId.compareTo(b.nodeId);
+        });
       final withMetadata = acc.models.where((m) => m.metadata != null);
       final model =
           withMetadata.isNotEmpty ? withMetadata.first : acc.models.first;
@@ -547,8 +555,8 @@ class LocalNodeService implements NodeService {
 
   NodeInfo _pickCoordinator(List<NodeInfo> candidates) {
     final sorted = [...candidates]..sort((a, b) {
-        final byMemory = b.hardware.usableMemoryBytes
-            .compareTo(a.hardware.usableMemoryBytes);
+        final byMemory =
+            b.effectiveBudgetBytes.compareTo(a.effectiveBudgetBytes);
         return byMemory != 0 ? byMemory : a.nodeId.compareTo(b.nodeId);
       });
     return sorted.first;
@@ -752,6 +760,8 @@ class LocalNodeService implements NodeService {
 
     try {
       _hardware = await _hardwareProbe.refresh(_hardware);
+      // The advertised budget derives from the refreshed hardware (§2.5).
+      _emitChanged();
     } on Object {
       // Keep the last profile when the cheap refresh fails.
     }
@@ -946,7 +956,8 @@ class LocalNodeService implements NodeService {
   }
 
   int _budgetBytes() {
-    final raw = (_hardware.usableMemoryBytes * _settings.memoryShare).floor();
+    final raw = _hardware.memoryBudgetBytes(
+        _settings.memoryBasis, _settings.memoryShare);
     return raw < 0 ? 0 : raw;
   }
 
