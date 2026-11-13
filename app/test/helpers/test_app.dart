@@ -17,12 +17,14 @@ Future<AppSession> testSession({
   Duration phaseDelay = Duration.zero,
   Duration tokenDelay = const Duration(milliseconds: 2),
   Duration downloadTick = const Duration(milliseconds: 20),
+  Duration verifyDuration = const Duration(milliseconds: 400),
   Duration scanLatency = const Duration(milliseconds: 20),
 }) async {
   final fake = FakeNodeService(
     phaseDelay: phaseDelay,
     tokenDelay: tokenDelay,
     downloadTick: downloadTick,
+    verifyDuration: verifyDuration,
     scanLatency: scanLatency,
   );
   return testSessionWith(fake, clientOnly: clientOnly);

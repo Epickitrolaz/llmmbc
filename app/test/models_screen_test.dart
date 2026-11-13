@@ -43,6 +43,46 @@ void main() {
     expect(stored.any((model) => model.ref.toString() == 'qwen3:30b-a3b'), isTrue);
   });
 
+  testWidgets('download row shows percent, speed, ETA and verifying progress', (tester) async {
+    final session = await testSession(
+      downloadTick: const Duration(milliseconds: 10),
+      verifyDuration: const Duration(milliseconds: 400),
+    );
+    await pumpApp(tester, session);
+    await openTab(tester, 'Models');
+
+    const key = 'qwen3:30b-a3b';
+    await tapVisible(tester, find.byKey(const Key('download-btn-$key')));
+    await tester.pump();
+    expect(find.text('Resolving'), findsOneWidget);
+
+    await tester.pump(const Duration(milliseconds: 60));
+    expect(find.text('Downloading'), findsOneWidget);
+    final percent = tester.widget<Text>(find.byKey(const Key('download-percent-$key'))).data!;
+    expect(RegExp(r'^\d+\.\d%$').hasMatch(percent), isTrue, reason: 'one decimal place: $percent');
+    expect(find.byKey(const Key('download-bytes-$key')), findsOneWidget);
+    expect(find.textContaining('/ 18.0 GiB'), findsOneWidget);
+    expect(tester.widget<Text>(find.byKey(const Key('download-speed-$key'))).data, '18.2 MB/s');
+    final eta = tester.widget<Text>(find.byKey(const Key('download-eta-$key'))).data!;
+    expect(eta, startsWith('ETA '));
+
+    // Reaching 100% enters verifying, which still shows a moving bar plus its own %.
+    await tester.pump(const Duration(milliseconds: 140));
+    final verifying = tester.widget<Text>(find.byKey(const Key('download-state-$key'))).data!;
+    expect(verifying, startsWith('Verifying '));
+    expect(verifying, endsWith('%'));
+    final bar = tester.widget<LinearProgressIndicator>(find.byKey(const Key('download-progress-$key')));
+    expect(bar.value, isNotNull);
+    expect(bar.value, greaterThan(0));
+    expect(bar.value, lessThan(1));
+    // Cancel stays available while verifying.
+    expect(find.byKey(const Key('download-cancel-$key')), findsOneWidget);
+
+    await tester.pump(const Duration(milliseconds: 500));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('local-model-qwen3:30b-a3b')), findsOneWidget);
+  });
+
   testWidgets('download can be cancelled', (tester) async {
     final session = await testSession(downloadTick: const Duration(milliseconds: 10));
     await pumpApp(tester, session);

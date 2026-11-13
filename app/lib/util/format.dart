@@ -21,6 +21,39 @@ String formatPercent(double fraction) => '${(fraction * 100).round()}%';
 /// `82%` with a fraction such as `0.824`.
 String formatFraction(double fraction) => '${(fraction * 100).round()}%';
 
+/// `42.3%` — download progress keeps one decimal place.
+String formatDownloadPercent(double fraction) {
+  final clamped = fraction.isFinite ? fraction.clamp(0.0, 1.0) : 0.0;
+  return '${(clamped * 100).toStringAsFixed(1)}%';
+}
+
+/// Transfer rate in decimal (SI) units, e.g. `18.2 MB/s`.
+String formatSpeed(double bytesPerSecond) {
+  if (!bytesPerSecond.isFinite || bytesPerSecond <= 0) return '0 B/s';
+  const units = ['B/s', 'kB/s', 'MB/s', 'GB/s', 'TB/s'];
+  var value = bytesPerSecond;
+  var unit = 0;
+  while (value >= 1000 && unit < units.length - 1) {
+    value /= 1000;
+    unit++;
+  }
+  final digits = unit == 0 || value >= 100 ? 0 : 1;
+  return '${value.toStringAsFixed(digits)} ${units[unit]}';
+}
+
+/// Short ETA: `1:23` below an hour, `1 h 05 m` from an hour up, `—` when unknown.
+String formatEta(Duration? eta) {
+  if (eta == null || eta.isNegative) return '—';
+  final seconds = eta.inSeconds;
+  final hours = seconds ~/ 3600;
+  final minutes = (seconds % 3600) ~/ 60;
+  final rest = seconds % 60;
+  if (hours > 0) {
+    return '$hours h ${minutes.toString().padLeft(2, '0')} m';
+  }
+  return '$minutes:${rest.toString().padLeft(2, '0')}';
+}
+
 /// Human friendly relative time for heartbeat columns.
 String formatRelativeTime(DateTime? time, {DateTime? now}) {
   if (time == null) return 'never';

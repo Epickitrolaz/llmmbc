@@ -21,7 +21,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
   final TextEditingController _name = TextEditingController();
   final TextEditingController _peerField = TextEditingController();
   bool _hydrated = false;
-  double _share = 0.8;
+  double _share = kDefaultMemoryShare;
+  MemoryBasis _basis = MemoryBasis.total;
   List<String> _logLines = const [];
   String? _peerError;
 
@@ -34,6 +35,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       final settings = _session.service.settings;
       _name.text = settings.name;
       _share = settings.memoryShare;
+      _basis = settings.memoryBasis;
       _logLines = _session.service.engine.logTail;
     }
   }
@@ -80,6 +82,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final hardware = _session.hardware;
     final self = _session.service.self;
     final clientOnly = _session.clientOnly;
+    final basisBytes = _basis == MemoryBasis.total
+        ? hardware.totalRamBytes + hardware.vramBytes
+        : hardware.usableMemoryBytes;
+    final budgetBytes = hardware.memoryBudgetBytes(_basis, _share);
 
     return ListView(
       padding: const EdgeInsets.fromLTRB(16, 4, 16, 24),
@@ -160,9 +166,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             clientOnly
                                 ? 'iOS cannot spawn llama.cpp processes: this device is client-only.'
                                 : settings.workerEnabled
-                                    ? 'This device lends up to ${formatBytes(_session.usableShareBytes)} '
-                                        '(${formatPercent(settings.memoryShare)} of usable memory) to sessions. '
-                                        'It never runs a model it does not have downloaded.'
+                                    ? 'This device lends up to ${formatBytes(_session.memoryBudgetBytes)} '
+                                        '(${formatPercent(settings.memoryShare)} of '
+                                        '${settings.memoryBasis == MemoryBasis.total ? 'all memory' : 'free memory'}) '
+                                        'to sessions. It never runs a model it does not have downloaded.'
                                     : 'Client-only: this device can start chats but never hosts a model. '
                                         'Its models disappear from the cluster model picker.',
                           ),
@@ -209,13 +216,58 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
+                      Text('Memory basis', style: theme.textTheme.titleSmall),
+                      const SizedBox(height: 8),
+                      SegmentedButton<MemoryBasis>(
+                        key: const Key('memory-basis'),
+                        segments: const [
+                          ButtonSegment(
+                            value: MemoryBasis.total,
+                            label: Text('Total RAM'),
+                            icon: Icon(Icons.memory),
+                          ),
+                          ButtonSegment(
+                            value: MemoryBasis.available,
+                            label: Text('Free RAM estimate'),
+                            icon: Icon(Icons.data_usage_outlined),
+                          ),
+                        ],
+                        selected: {_basis},
+                        onSelectionChanged: (selection) async {
+                          final basis = selection.first;
+                          setState(() => _basis = basis);
+                          await _session.setMemoryBasis(basis);
+                          if (!mounted) return;
+                          setState(() => _basis = _session.service.settings.memoryBasis);
+                        },
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        _basis == MemoryBasis.total
+                            ? 'Lends a share of all installed memory; the OS frees cached apps as needed.'
+                            : 'Lends a share of what is free right now (the previous behaviour).',
+                        key: const Key('memory-basis-copy'),
+                        style: theme.textTheme.bodySmall?.copyWith(color: scheme.onSurfaceVariant),
+                      ),
+                      if (_basis == MemoryBasis.total && hardware.os == 'android') ...[
+                        const SizedBox(height: 10),
+                        NoticeBanner(
+                          key: const Key('memory-basis-warning'),
+                          message: 'On a phone this can over-promise: the system may close other apps while a '
+                              'session runs. Free RAM estimate is the safer choice for a shared device.',
+                          tone: scheme.tertiary,
+                          icon: Icons.phonelink_erase_outlined,
+                        ),
+                      ],
+                      const SizedBox(height: 16),
                       Row(
                         children: [
                           Expanded(child: Text('Memory share', style: theme.textTheme.titleSmall)),
                           const SizedBox(width: 8),
                           Flexible(
                             child: Text(
-                              '${formatPercent(_share)} · ${formatBytes((hardware.usableMemoryBytes * _share).round())}',
+                              '${formatPercent(_share)} · ${formatBytes(budgetBytes)}',
+                              key: const Key('memory-share-value'),
                               textAlign: TextAlign.right,
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
@@ -234,13 +286,25 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         onChanged: (value) => setState(() => _share = value),
                         onChangeEnd: (value) async {
                           await _session.setMemoryShare(value);
+                          if (!mounted) return;
                           setState(() => _share = _session.service.settings.memoryShare);
                         },
                       ),
                       Text(
-                        'Usable memory here is ${formatBytes(hardware.usableMemoryBytes)}: available RAM '
-                        '(${formatBytes(hardware.availableRamBytes)}) minus the safety reserve, plus VRAM. '
-                        'The cluster planner never assigns more than this budget.',
+                        'Lends ${formatBytes(budgetBytes)} of ${formatBytes(basisBytes)} '
+                        '(${_basisLabel(_basis)})',
+                        key: const Key('memory-preview'),
+                        style: theme.textTheme.bodyMedium?.copyWith(color: scheme.onSurface),
+                      ),
+                      const SizedBox(height: 6),
+                      Text(
+                        _basis == MemoryBasis.total
+                            ? 'The total basis starts from ${formatBytes(hardware.totalRamBytes)} RAM'
+                                '${hardware.vramBytes > 0 ? ' + ${formatBytes(hardware.vramBytes)} VRAM' : ''}. '
+                                'The cluster planner never assigns more than the advertised budget.'
+                            : 'Usable memory here is ${formatBytes(hardware.usableMemoryBytes)}: available RAM '
+                                '(${formatBytes(hardware.availableRamBytes)}) minus the safety reserve, plus VRAM. '
+                                'The cluster planner never assigns more than this budget.',
                         style: theme.textTheme.bodySmall?.copyWith(color: scheme.onSurfaceVariant),
                       ),
                     ],
@@ -424,6 +488,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 }
+
+String _basisLabel(MemoryBasis basis) =>
+    basis == MemoryBasis.total ? 'Total RAM' : 'Free RAM estimate';
 
 String _workerServiceCopy(AppSession session, bool workerEnabled) {
   if (!workerEnabled) {

@@ -103,5 +103,30 @@ void main() {
       expect(formatRelativeTime(now.subtract(const Duration(minutes: 5)), now: now), '5m ago');
       expect(formatClock(now), '12:00');
     });
+
+    test('download percentage keeps one decimal place', () {
+      expect(formatDownloadPercent(0), '0.0%');
+      expect(formatDownloadPercent(0.4231), '42.3%');
+      expect(formatDownloadPercent(1), '100.0%');
+      expect(formatDownloadPercent(1.7), '100.0%');
+    });
+
+    test('speed uses decimal units', () {
+      expect(formatSpeed(0), '0 B/s');
+      expect(formatSpeed(-12), '0 B/s');
+      expect(formatSpeed(18_200_000), '18.2 MB/s');
+      expect(formatSpeed(1_250_000_000), '1.3 GB/s');
+      expect(formatSpeed(640), '640 B/s');
+    });
+
+    test('eta switches from m:ss to hours', () {
+      expect(formatEta(Duration.zero), '0:00');
+      expect(formatEta(const Duration(minutes: 1, seconds: 23)), '1:23');
+      expect(formatEta(const Duration(seconds: 59)), '0:59');
+      expect(formatEta(const Duration(hours: 1, minutes: 5)), '1 h 05 m');
+      expect(formatEta(const Duration(hours: 2, minutes: 30, seconds: 4)), '2 h 30 m');
+      expect(formatEta(null), '—');
+      expect(formatEta(const Duration(seconds: -3)), '—');
+    });
   });
 }

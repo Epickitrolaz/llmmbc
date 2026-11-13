@@ -13,6 +13,9 @@ import 'package:llmmbc_core/llmmbc_core.dart';
 const int _mib = 1024 * 1024;
 const int _gib = 1024 * _mib;
 
+/// Demo link rate reported by simulated pulls (bytes/s).
+const double _simulatedLinkBytesPerSecond = 18.2e6;
+
 ModelRef _ref(String value) => ModelRef.parse(value);
 
 GgufMetadata _denseMeta(String architecture, int layers, int context, int bytes) => GgufMetadata(
@@ -40,6 +43,7 @@ class FakeNodeService implements NodeService {
     this.phaseDelay = Duration.zero,
     this.tokenDelay = const Duration(milliseconds: 14),
     this.downloadTick = const Duration(milliseconds: 60),
+    this.verifyDuration = const Duration(milliseconds: 800),
     this.scanLatency = const Duration(milliseconds: 350),
     this.engineAvailable = true,
   }) {
@@ -77,6 +81,10 @@ class FakeNodeService implements NodeService {
   final Duration phaseDelay;
   final Duration tokenDelay;
   final Duration downloadTick;
+
+  /// Time the simulated sha256 verification takes, split into four steps so the
+  /// verifying progress bar visibly moves.
+  final Duration verifyDuration;
   final Duration scanLatency;
 
   /// Simulates a build without engine binaries (worker still runs the node API).
@@ -101,7 +109,8 @@ class FakeNodeService implements NodeService {
     name: 'This phone',
     dataDir: '/data/user/0/dev.llmmbc.app/files',
     manualPeers: const ['192.168.1.20:47101'],
-    memoryShare: 0.8,
+    memoryShare: kDefaultMemoryShare,
+    memoryBasis: MemoryBasis.total,
   );
 
   @override
@@ -145,6 +154,7 @@ class FakeNodeService implements NodeService {
         status: _session == null ? NodeStatus.worker : NodeStatus.coordinator,
         hardware: _hardware,
         models: List.unmodifiable(_localModels),
+        memoryBudgetBytes: _hardware.memoryBudgetBytes(_settings.memoryBasis, _settings.memoryShare),
         appVersion: '0.1.0',
         isSelf: true,
         reachable: true,
@@ -216,7 +226,7 @@ class FakeNodeService implements NodeService {
       );
     }
     candidates.sort((a, b) {
-      final memory = b.hardware.usableMemoryBytes.compareTo(a.hardware.usableMemoryBytes);
+      final memory = b.effectiveBudgetBytes.compareTo(a.effectiveBudgetBytes);
       if (memory != 0) return memory;
       return a.nodeId.compareTo(b.nodeId);
     });
@@ -315,7 +325,7 @@ You asked **$short** — here is the simulated answer from `$model`.
 
 ## How this request was served
 
-- Coordinator: **$coordinator** (largest usable memory in the cluster)
+- Coordinator: **$coordinator** (largest advertised memory budget in the cluster)
 - Candidate workers: **$workers**
 - Transport: OpenAI-compatible SSE from the node API
 
@@ -407,6 +417,7 @@ llama-server --model $model --rpc worker1:47102,worker2:47102 \\
             metadata: _denseMeta('llama', 28, 8192, 2 * _gib),
           ),
         ],
+        memoryBudgetBytes: studio.memoryBudgetBytes(MemoryBasis.total, kDefaultMemoryShare),
         lastSeen: now.subtract(const Duration(seconds: 2)),
       ),
       NodeInfo(
@@ -432,6 +443,7 @@ llama-server --model $model --rpc worker1:47102,worker2:47102 \\
             metadata: _moeMeta('granite_moe', 24, 4096, 32, 4, 1400 * _mib),
           ),
         ],
+        memoryBudgetBytes: pixel.memoryBudgetBytes(MemoryBasis.total, kDefaultMemoryShare),
         lastSeen: now.subtract(const Duration(seconds: 5)),
       ),
       NodeInfo(
@@ -451,6 +463,7 @@ llama-server --model $model --rpc worker1:47102,worker2:47102 \\
             metadata: _moeMeta('granite_moe', 24, 4096, 32, 4, 1400 * _mib),
           ),
         ],
+        memoryBudgetBytes: pi.memoryBudgetBytes(MemoryBasis.total, kDefaultMemoryShare),
         lastSeen: now.subtract(const Duration(minutes: 1)),
       ),
       NodeInfo(
@@ -463,6 +476,7 @@ llama-server --model $model --rpc worker1:47102,worker2:47102 \\
         status: NodeStatus.idle,
         hardware: tablet,
         models: const [],
+        memoryBudgetBytes: tablet.memoryBudgetBytes(MemoryBasis.total, kDefaultMemoryShare),
         lastSeen: now.subtract(const Duration(minutes: 3)),
       ),
     ];
@@ -495,14 +509,13 @@ class _FakeModelStore implements ModelStore {
   @override
   Stream<DownloadProgress> pull(ModelRef ref) {
     final key = ref.toString();
-    if (localModels.any((model) => model.ref == ref)) {
-      final local = localModels.firstWhere((model) => model.ref == ref);
+    final local = localModels.where((model) => model.ref == ref).firstOrNull;
+    if (local != null) {
       return Stream.value(
         DownloadProgress(ref, DownloadState.done, receivedBytes: local.sizeBytes, totalBytes: local.sizeBytes),
       );
     }
-    final previous = _active.remove(key);
-    previous?.close();
+    _active.remove(key)?.close();
 
     final total = _approxSize(ref);
     late StreamController<DownloadProgress> controller;
@@ -520,6 +533,60 @@ class _FakeModelStore implements ModelStore {
       _service.notifyChanged();
     }
 
+    void complete() {
+      final entry = catalog().where((e) => e.ref == ref).firstOrNull;
+      localModels.add(
+        LocalModel(
+          ref: ref,
+          ggufPath: '$modelsDir/blobs/sha256-${ref.name}',
+          sizeBytes: total,
+          metadata: entry == null
+              ? _denseMeta('llama', 28, 8192, total)
+              : (entry.isMoe ? _moeMeta('moe', 24, 4096, 32, 4, total) : _denseMeta('llama', 28, 8192, total)),
+        ),
+      );
+      controller.add(DownloadProgress(ref, DownloadState.done, receivedBytes: total, totalBytes: total));
+      _active.remove(key);
+      controller.close();
+      _service.notifyChanged();
+    }
+
+    // The demo compresses transfer time, but reports a plausible link rate and a
+    // matching ETA so the stats row shows realistic numbers.
+    void startVerifying() {
+      final step = _service.verifyDuration ~/ 4;
+      var hashed = 0;
+
+      void hashingStep() {
+        if (_cancelled.contains(key)) {
+          finishCancelled();
+          return;
+        }
+        hashed += 1;
+        controller.add(DownloadProgress(
+          ref,
+          DownloadState.verifying,
+          receivedBytes: total * hashed ~/ 4,
+          totalBytes: total,
+        ));
+        if (hashed >= 4) {
+          timer?.cancel();
+          complete();
+        }
+      }
+
+      if (step <= Duration.zero) {
+        for (var i = 0; i < 4; i++) {
+          hashingStep();
+        }
+      } else {
+        // First hash slice immediately so `Verifying x%` replaces `Downloading`
+        // without waiting a whole step.
+        hashingStep();
+        if (hashed < 4) timer = Timer.periodic(step, (_) => hashingStep());
+      }
+    }
+
     controller = StreamController<DownloadProgress>(
       onListen: () {
         controller.add(DownloadProgress(ref, DownloadState.resolving, totalBytes: total));
@@ -530,34 +597,20 @@ class _FakeModelStore implements ModelStore {
           }
           received += total ~/ 18;
           if (received < total) {
-            controller.add(
-              DownloadProgress(ref, DownloadState.downloading, receivedBytes: received, totalBytes: total),
-            );
+            final remaining = total - received;
+            controller.add(DownloadProgress(
+              ref,
+              DownloadState.downloading,
+              receivedBytes: received,
+              totalBytes: total,
+              bytesPerSecond: _simulatedLinkBytesPerSecond,
+              eta: Duration(seconds: (remaining / _simulatedLinkBytesPerSecond).ceil()),
+            ));
             return;
           }
           t.cancel();
           received = total;
-          controller.add(DownloadProgress(ref, DownloadState.verifying, receivedBytes: total, totalBytes: total));
-          Timer(const Duration(milliseconds: 120), () {
-            if (controller.isClosed) return;
-            final entry = catalog().where((e) => e.ref == ref).firstOrNull;
-            localModels.add(
-              LocalModel(
-                ref: ref,
-                ggufPath: '$modelsDir/blobs/sha256-${ref.name}',
-                sizeBytes: total,
-                metadata: entry == null
-                    ? _denseMeta('llama', 28, 8192, total)
-                    : (entry.isMoe
-                        ? _moeMeta('moe', 24, 4096, 32, 4, total)
-                        : _denseMeta('llama', 28, 8192, total)),
-              ),
-            );
-            controller.add(DownloadProgress(ref, DownloadState.done, receivedBytes: total, totalBytes: total));
-            _active.remove(key);
-            controller.close();
-            _service.notifyChanged();
-          });
+          startVerifying();
         });
       },
       onCancel: () {
@@ -706,6 +759,7 @@ class _FakeDiscovery implements Discovery {
           metadata: _denseMeta('qwen3', 28, 40960, 520 * _mib),
         ),
       ],
+      memoryBudgetBytes: (8 * _gib * kDefaultMemoryShare).round(),
       lastSeen: DateTime.now(),
     );
     _service._peers = [..._service._peers, peer];
