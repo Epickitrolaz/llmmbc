@@ -49,6 +49,22 @@ String broadcastAddressFor(String address, int prefixLength) {
       '${(broadcast >> 8) & 0xff}.${broadcast & 0xff}';
 }
 
+/// Whether [address] can be used as a UDP broadcast destination.
+///
+/// Rejects malformed input, `0.0.0.0` (and other `0.x.x.x` unspecified forms)
+/// and loopback targets, which the kernel reports as unreachable (#40).
+@visibleForTesting
+bool isUsableBroadcastAddress(String address) {
+  final parts = address.split('.');
+  if (parts.length != 4) return false;
+  for (final part in parts) {
+    final value = int.tryParse(part);
+    if (value == null || value < 0 || value > 255) return false;
+  }
+  final first = int.parse(parts.first);
+  return first != 0 && first != 127;
+}
+
 /// UDP beacon/probe discovery with multicast, a /24 subnet sweep fallback and
 /// manually configured peers.
 class LanDiscovery implements Discovery {
@@ -63,12 +79,17 @@ class LanDiscovery implements Discovery {
   final Future<List<InternetAddress>> Function()? localAddresses;
   final Future<Map<String, int>> Function()? netmaskResolver;
 
+  /// Test seam for the default-route probe (Linux/Android use /proc/net/route).
+  final Future<bool> Function()? defaultRouteResolver;
+
   RawDatagramSocket? _socket;
   Timer? _beaconTimer;
   Timer? _maintenanceTimer;
   NodeInfo Function()? _self;
   NodeSettings? _settings;
   bool _started = false;
+  bool _hasDefaultRoute = true;
+  bool _reportedSendError = false;
 
   final Map<String, _PeerEntry> _peers = {};
   final Set<String> _resolving = {};
@@ -94,6 +115,7 @@ class LanDiscovery implements Discovery {
     this.sweepConcurrency = 64,
     this.localAddresses,
     this.netmaskResolver,
+    this.defaultRouteResolver,
   })  : _client = client ?? HttpNodeClient(),
         _hooks = hooks,
         _now = now ?? DateTime.now;
@@ -141,7 +163,8 @@ class LanDiscovery implements Discovery {
       } catch (_) {
         // Multicast may be unavailable in some containers.
       }
-      socket.listen(_onSocketEvent);
+      socket.listen(_onSocketEvent,
+          onError: _onSocketError, cancelOnError: false);
       _socket = socket;
     } catch (_) {
       // No permission / no interfaces: degrade to sweep + manual peers.
@@ -428,6 +451,32 @@ class LanDiscovery implements Discovery {
       _interfaceAddresses = const [];
     }
     _prefixByAddress = await _resolvePrefixes();
+    _hasDefaultRoute = await _resolveHasDefaultRoute();
+  }
+
+  /// A host without a default route (airplane mode, netns, some lab/Android
+  /// setups) cannot send to 255.255.255.255: skip it instead of crashing (#40).
+  Future<bool> _resolveHasDefaultRoute() async {
+    final custom = defaultRouteResolver;
+    if (custom != null) {
+      try {
+        return await custom();
+      } on Object {
+        return true;
+      }
+    }
+    if (!Platform.isLinux && !Platform.isAndroid) return true;
+    try {
+      final lines = await File('/proc/net/route').readAsLines();
+      for (final line in lines.skip(1)) {
+        final fields = line.trim().split(RegExp(r'\s+'));
+        if (fields.length < 8) continue;
+        if (fields[1] == '00000000' && fields[7] == '00000000') return true;
+      }
+      return false;
+    } on Object {
+      return true;
+    }
   }
 
   static Future<List<InternetAddress>> _defaultAddresses() async {
@@ -518,17 +567,44 @@ class LanDiscovery implements Discovery {
   }
 
   List<String> _broadcastTargets() {
-    final targets = <String>{'255.255.255.255'};
+    final targets = <String>{};
+    // The limited broadcast needs a default route; without one the kernel
+    // reports ENETUNREACH and an unhandled socket error used to kill the node.
+    if (_hasDefaultRoute) targets.add('255.255.255.255');
     for (final address in _interfaceAddresses) {
       if (address.isLoopback) continue;
+      if (!isUsableBroadcastAddress(address.address)) continue;
       final prefix = _prefixByAddress[address.address] ?? 24;
-      targets.add(broadcastAddressFor(address.address, prefix));
+      final broadcast = broadcastAddressFor(address.address, prefix);
+      if (!isUsableBroadcastAddress(broadcast)) continue;
+      if (broadcast == '255.255.255.255' && !_hasDefaultRoute) continue;
+      targets.add(broadcast);
     }
     return targets.toList(growable: false);
   }
 
   @visibleForTesting
   List<String> debugBroadcastTargets() => _broadcastTargets();
+
+  @visibleForTesting
+  bool get debugHasDefaultRoute => _hasDefaultRoute;
+
+  void _onSocketError(Object error) {
+    // RawDatagramSocket reports send failures asynchronously on its stream;
+    // without this handler they become unhandled errors and abort the process.
+    _logSendFailure(error);
+  }
+
+  void _logSendFailure(Object error) {
+    if (_reportedSendError) return;
+    _reportedSendError = true;
+    try {
+      stderr.writeln('llmmbc discovery: UDP send failed ($error); '
+          'continuing with the subnet sweep and manual peers');
+    } on Object {
+      // Logging must never fail startup.
+    }
+  }
 
   void _sendBeacon() {
     final self = _self?.call();
@@ -576,16 +652,18 @@ class LanDiscovery implements Discovery {
 
   void _sendToNetwork(RawDatagramSocket socket, List<int> payload) {
     for (final target in _broadcastTargets()) {
+      final address = InternetAddress.tryParse(target);
+      if (address == null || address.address == '0.0.0.0') continue;
       try {
-        socket.send(payload, InternetAddress(target), kDiscoveryPort);
-      } catch (_) {
-        // interface without broadcast support
+        socket.send(payload, address, kDiscoveryPort);
+      } catch (e) {
+        _logSendFailure(e);
       }
     }
     try {
       socket.send(payload, InternetAddress(kMulticastGroup), kDiscoveryPort);
-    } catch (_) {
-      // multicast unavailable
+    } catch (e) {
+      _logSendFailure(e);
     }
   }
 

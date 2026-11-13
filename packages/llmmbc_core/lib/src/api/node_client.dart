@@ -11,14 +11,44 @@ import '../interfaces.dart';
 import '../models.dart';
 import 'sse.dart';
 
+/// Chat routing marker (`docs/ARCHITECTURE.md` §3).
+const String kHeaderChatRoute = 'X-LLMMBC-Route';
+
+/// Value of [kHeaderChatRoute] that asks the receiver to serve as coordinator.
+const String kRouteCoordinator = 'coordinator';
+
+/// Chat requests must tolerate a cold model load on the coordinator before the
+/// first SSE byte; ≥ 10 minutes and separate from [HttpNodeClient.timeout].
+const Duration kChatFirstByteTimeout = Duration(minutes: 10);
+
+/// Maximum silence between two SSE chunks of an active chat stream.
+const Duration kChatIdleTimeout = Duration(minutes: 2);
+
+/// [NodeClient] capability to add [kHeaderChatRoute] to a forwarded chat.
+abstract class ChatRouteClient {
+  Stream<ChatDelta> chat(
+    Uri base,
+    ModelRef model,
+    List<ChatMessage> messages, {
+    double? temperature,
+    int? maxTokens,
+    bool asCoordinator,
+  });
+}
+
 /// `NodeClient` implementation over `package:http`.
-class HttpNodeClient implements NodeClient {
+class HttpNodeClient implements NodeClient, ChatRouteClient {
   final Duration timeout;
+  final Duration chatTimeout;
+  final Duration chatIdleTimeout;
   final http.Client _http;
 
-  HttpNodeClient(
-      {this.timeout = const Duration(seconds: 5), http.Client? client})
-      : _http = client ??
+  HttpNodeClient({
+    this.timeout = const Duration(seconds: 5),
+    this.chatTimeout = kChatFirstByteTimeout,
+    this.chatIdleTimeout = kChatIdleTimeout,
+    http.Client? client,
+  }) : _http = client ??
             io_client.IOClient(HttpClient()..connectionTimeout = timeout);
 
   static const Map<String, String> _jsonHeaders = {
@@ -132,6 +162,7 @@ class HttpNodeClient implements NodeClient {
     List<ChatMessage> messages, {
     double? temperature,
     int? maxTokens,
+    bool asCoordinator = false,
   }) async* {
     final body = <String, dynamic>{
       'model': model.toString(),
@@ -144,12 +175,16 @@ class HttpNodeClient implements NodeClient {
     final request = http.Request('POST', _uri(base, '/v1/chat/completions'))
       ..headers.addAll(_headers(base))
       ..body = jsonEncode(body);
+    if (asCoordinator) request.headers[kHeaderChatRoute] = kRouteCoordinator;
 
     final http.StreamedResponse res;
     try {
-      res = await _http.send(request).timeout(timeout);
+      // Chat waits for the coordinator's first token (cold model load), which is
+      // far longer than a regular API call; never apply the 5 s API timeout here.
+      res = await _http.send(request).timeout(chatTimeout);
     } on TimeoutException {
-      throw LlmmbcException('engine_error', 'chat request timed out');
+      throw LlmmbcException('engine_error',
+          'chat request timed out after ${chatTimeout.inSeconds}s waiting for the first byte');
     } on SocketException catch (e) {
       throw LlmmbcException('engine_error', 'cannot reach node: ${e.message}');
     }
@@ -164,7 +199,80 @@ class HttpNodeClient implements NodeClient {
     final servedBy = res.headers[kHeaderNode.toLowerCase()] ??
         res.headers[kHeaderNode] ??
         base.host;
-    yield* parseOpenAiSse(res.stream, servedBy: servedBy);
+    final deltas = parseOpenAiSse(res.stream, servedBy: servedBy);
+    // Once streaming, a silent stream means the coordinator/engine went away.
+    yield* _withIdleTimeout(deltas, chatIdleTimeout);
+  }
+
+  /// Fails the stream with `engine_error` when no chunk arrives for [idle].
+  ///
+  /// A manual watchdog is used instead of `Stream.timeout` so the pending HTTP
+  /// subscription is cancelled explicitly and the error is delivered at once.
+  Stream<ChatDelta> _withIdleTimeout(Stream<ChatDelta> source, Duration idle) {
+    late StreamController<ChatDelta> controller;
+    StreamSubscription<ChatDelta>? subscription;
+    Timer? timer;
+    var closed = false;
+
+    void finish() {
+      if (closed) return;
+      closed = true;
+      timer?.cancel();
+      timer = null;
+      controller.close();
+    }
+
+    void arm() {
+      timer?.cancel();
+      timer = Timer(idle, () {
+        if (closed) return;
+        closed = true;
+        timer = null;
+        controller.addError(LlmmbcException(
+            'engine_error', 'chat stream stalled for ${idle.inSeconds}s'));
+        controller.close();
+        final pending = subscription;
+        if (pending != null) {
+          unawaited(pending.cancel().catchError((Object _) {}));
+        }
+      });
+    }
+
+    controller = StreamController<ChatDelta>(
+      onListen: () {
+        arm();
+        subscription = source.listen(
+          (delta) {
+            if (closed) return;
+            arm();
+            controller.add(delta);
+          },
+          onError: (Object error, StackTrace stackTrace) {
+            if (closed) return;
+            closed = true;
+            timer?.cancel();
+            controller.addError(error, stackTrace);
+            controller.close();
+          },
+          onDone: finish,
+          cancelOnError: true,
+        );
+      },
+      onPause: () {
+        timer?.cancel();
+      },
+      onResume: () {
+        if (!closed) arm();
+      },
+      onCancel: () {
+        timer?.cancel();
+        final pending = subscription;
+        if (pending != null) {
+          unawaited(pending.cancel().catchError((Object _) {}));
+        }
+      },
+    );
+    return controller.stream;
   }
 
   /// Releases the underlying HTTP client. Not part of [NodeClient]; used by owners.

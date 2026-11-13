@@ -165,12 +165,14 @@ class RpcStartCall {
   RpcStartCall(this.base, this.sessionId, this.model, this.coordinatorId);
 }
 
-class FakeNodeClient implements NodeClient {
+class FakeNodeClient implements NodeClient, ChatRouteClient {
   final Map<int, NodeInfo> infoByPort = {};
   final Map<int, List<NodeInfo>> peersByPort = {};
   final List<RpcStartCall> startRpcCalls = [];
   final List<({Uri base, String sessionId})> stopRpcCalls = [];
   final List<Uri> chatBases = [];
+  final List<bool> chatRouteFlags = [];
+  Map<int, int> rpcPortByApiPort = {};
   List<ChatDelta> chatDeltas = [
     const ChatDelta('remote '),
     const ChatDelta('answer', finishReason: 'stop'),
@@ -216,7 +218,11 @@ class FakeNodeClient implements NodeClient {
     startRpcCalls.add(RpcStartCall(base, sessionId, model, coordinatorId));
     final error = startRpcError;
     if (error != null) throw error;
-    return (host: base.host, port: 5000, budgetBytes: 1 << 30);
+    return (
+      host: base.host,
+      port: rpcPortByApiPort[base.port] ?? 5000,
+      budgetBytes: 1 << 30
+    );
   }
 
   @override
@@ -231,8 +237,10 @@ class FakeNodeClient implements NodeClient {
     List<ChatMessage> messages, {
     double? temperature,
     int? maxTokens,
+    bool asCoordinator = false,
   }) async* {
     chatBases.add(base);
+    chatRouteFlags.add(asCoordinator);
     for (final delta in chatDeltas) {
       yield ChatDelta(delta.content,
           finishReason: delta.finishReason, servedBy: 'remote');

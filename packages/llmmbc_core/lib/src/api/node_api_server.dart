@@ -7,6 +7,7 @@ import '../constants.dart';
 import '../interfaces.dart';
 import '../models.dart';
 import '../node/node_service.dart';
+import 'node_client.dart';
 import 'sse.dart';
 
 const Map<String, int> _errorStatus = {
@@ -201,13 +202,37 @@ class NodeApiServer {
     // OpenAI's default is `stream: false`.
     final stream = body['stream'] as bool? ?? false;
 
-    final deltas = _local.handleChat(model, messages,
+    final deltas = _routeChat(request, model, messages,
         temperature: temperature, maxTokens: maxTokens);
     if (stream) {
       await _streamChat(response, model, deltas);
     } else {
       await _bufferedChat(response, model, deltas);
     }
+  }
+
+  /// §3: without `X-LLMMBC-Route` this node is the requester and routes to the
+  /// coordinator (possibly itself); with the header it serves locally and never
+  /// forwards again, which keeps routing loop-free.
+  Stream<ChatDelta> _routeChat(
+    HttpRequest request,
+    ModelRef model,
+    List<ChatMessage> messages, {
+    double? temperature,
+    int? maxTokens,
+  }) {
+    final route = request.headers.value(kHeaderChatRoute)?.trim();
+    final asCoordinator = route != null && route.isNotEmpty;
+    if (asCoordinator && route != kRouteCoordinator) {
+      throw LlmmbcException(
+          'bad_request', 'unsupported $kHeaderChatRoute value: $route');
+    }
+    if (asCoordinator) {
+      return _local.handleChat(model, messages,
+          temperature: temperature, maxTokens: maxTokens);
+    }
+    return _local.chat(model, messages,
+        temperature: temperature, maxTokens: maxTokens);
   }
 
   Future<void> _streamChat(
@@ -295,7 +320,7 @@ class NodeApiServer {
     response.headers.set('Access-Control-Allow-Origin', '*');
     response.headers.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     response.headers.set('Access-Control-Allow-Headers',
-        'Content-Type, $kHeaderProtocol, $kHeaderNode');
+        'Content-Type, $kHeaderProtocol, $kHeaderNode, $kHeaderChatRoute');
   }
 
   Future<void> _json(HttpResponse response, Object body) async {

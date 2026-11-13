@@ -297,4 +297,75 @@ void main() {
     discovery.debugSeedPeer(nodeInfo('self'));
     expect(discovery.peers.where((p) => p.nodeId == 'self'), isEmpty);
   });
+
+  group('no default route (#40)', () {
+    test('validates broadcast targets', () {
+      expect(isUsableBroadcastAddress('10.0.0.255'), isTrue);
+      expect(isUsableBroadcastAddress('172.20.255.255'), isTrue);
+      expect(isUsableBroadcastAddress('0.0.0.0'), isFalse);
+      expect(isUsableBroadcastAddress('0.0.0.255'), isFalse);
+      expect(isUsableBroadcastAddress('127.0.0.1'), isFalse);
+      expect(isUsableBroadcastAddress('10.0.0.256'), isFalse);
+      expect(isUsableBroadcastAddress('not-an-ip'), isFalse);
+    });
+
+    test('never sends to 0.0.0.0 or an unspecified broadcast', () async {
+      final discovery = LanDiscovery(
+        client: FakeNodeClient(),
+        sweepEnabled: false,
+        localAddresses: () async => [InternetAddress('0.0.0.0')],
+        netmaskResolver: () async => {'0.0.0.0': 24},
+        defaultRouteResolver: () async => true,
+      );
+      addTearDown(discovery.stop);
+      await discovery.start(
+        () => nodeInfo('self', host: '0.0.0.0'),
+        const NodeSettings(
+            nodeId: 'self', name: 'self', dataDir: '/tmp/d', apiPort: 47101),
+      );
+      final targets = discovery.debugBroadcastTargets();
+      expect(targets, isNot(contains('0.0.0.0')));
+      expect(targets, isNot(contains('0.0.0.255')));
+    });
+
+    test('skips the limited broadcast but keeps the subnet broadcast',
+        () async {
+      final discovery = LanDiscovery(
+        client: FakeNodeClient(),
+        sweepEnabled: false,
+        localAddresses: () async => [InternetAddress('10.99.0.1')],
+        netmaskResolver: () async => {'10.99.0.1': 24},
+        defaultRouteResolver: () async => false,
+      );
+      addTearDown(discovery.stop);
+      await discovery.start(
+        () => nodeInfo('self', host: '10.99.0.1'),
+        const NodeSettings(
+            nodeId: 'self', name: 'self', dataDir: '/tmp/d', apiPort: 47101),
+      );
+      expect(discovery.debugHasDefaultRoute, isFalse);
+      expect(discovery.debugBroadcastTargets(), ['10.99.0.255']);
+    });
+
+    test('starts without interfaces and keeps manual peers working', () async {
+      final remote = nodeInfo('manual-peer', apiPort: 47101);
+      final client = FakeNodeClient()..infoByPort[47101] = remote;
+      final discovery = LanDiscovery(
+        client: client,
+        sweepEnabled: false,
+        localAddresses: () async => const [],
+        defaultRouteResolver: () async => false,
+      );
+      addTearDown(discovery.stop);
+      await discovery.start(
+        () => nodeInfo('self'),
+        const NodeSettings(
+            nodeId: 'self', name: 'self', dataDir: '/tmp/d', apiPort: 47101),
+      );
+      expect(discovery.debugBroadcastTargets(), isEmpty);
+      final resolved = await discovery.addManualPeer('127.0.0.1:47101');
+      expect(resolved?.nodeId, 'manual-peer');
+      expect(discovery.peers.map((p) => p.nodeId), contains('manual-peer'));
+    });
+  });
 }
