@@ -1,5 +1,13 @@
 name: Release
 
+# Repository variable LLMMBC_ENABLE_MACOS (default: unset/false)
+# -------------------------------------------------------------------
+# Set it to "true" only when macOS runners are available for this repository
+# (public repo or paid private-repo minutes). When unset/false, the macOS
+# engine/CLI/app jobs and the iOS job are not scheduled at all, and the rest of
+# the release still publishes Linux/Windows/Android artifacts. Release notes
+# list both included and skipped platforms.
+
 on:
   push:
     branches: [main]
@@ -61,8 +69,8 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # A file-existence check is not enough: bin/llmmbc_node.dart exists on main as
-  # a contract stub that only throws. Every CLI/image/E2E job is gated on this
-  # smoke test actually producing HardwareProfile JSON.
+  # a contract stub that only throws. Every CLI/image job is gated on this smoke
+  # test actually producing HardwareProfile JSON (issue #12).
   # ---------------------------------------------------------------------------
   cli-smoke:
     name: CLI smoke test
@@ -90,19 +98,21 @@ jobs:
           dart pub get
           if ! out=$(dart run bin/llmmbc_node.dart hw); then
             echo "working=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::llmmbc_node is not functional yet (hw exited non-zero); skipping CLI, Docker and release publication"
+            echo "::notice::llmmbc_node is not functional yet (hw exited non-zero); skipping CLI and Docker"
             exit 0
           fi
           printf '%s\n' "${out}"
           if [[ "${out}" != \{* ]] || ! grep -q '"totalRamBytes"' <<<"${out}"; then
             echo "working=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::llmmbc_node hw did not print HardwareProfile JSON; skipping CLI, Docker and release publication"
+            echo "::notice::llmmbc_node hw did not print HardwareProfile JSON; skipping CLI and Docker"
             exit 0
           fi
           echo "working=true" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
-  # llama.cpp engine binaries, one job per target. Cached by LLAMA_CPP_VERSION.
+  # llama.cpp engine binaries. Cached by LLAMA_CPP_VERSION.
+  # macOS lives in its own optional job so an unavailable macOS runner can
+  # never cancel this matrix or skip the Linux/Windows/Android jobs (#50).
   # ---------------------------------------------------------------------------
   engine:
     name: Engine ${{ matrix.target }}
@@ -118,8 +128,6 @@ jobs:
             os: ubuntu-24.04-arm
           - target: windows-x64
             os: windows-2022
-          - target: macos-arm64
-            os: macos-14
           - target: android-arm64
             os: ubuntu-24.04
           - target: android-x64
@@ -179,12 +187,61 @@ jobs:
           retention-days: 7
 
   # ---------------------------------------------------------------------------
+  # Optional macOS engine (LLMMBC_ENABLE_MACOS == 'true'). Split out so a
+  # cancelled macOS runner does not cancel the main engine matrix above.
+  # ---------------------------------------------------------------------------
+  engine-macos:
+    name: Engine macos-arm64 (optional)
+    needs: meta
+    if: vars.LLMMBC_ENABLE_MACOS == 'true' && needs.meta.outputs.has_engine == 'true'
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read LLAMA_CPP_VERSION
+        id: llama
+        shell: bash
+        run: |
+          if [ -f native/LLAMA_CPP_VERSION ]; then
+            value=$(tr -d '[:space:]' < native/LLAMA_CPP_VERSION)
+          else
+            value=unpinned
+            echo "::notice::native/LLAMA_CPP_VERSION is missing; engine cache key is not pinned"
+          fi
+          echo "value=${value}" >> "$GITHUB_OUTPUT"
+      - name: Cache engine build
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: engine-out/macos-arm64
+          key: engine-macos-arm64-${{ steps.llama.outputs.value }}-${{ hashFiles('scripts/build_engine.sh', 'scripts/fetch_engine.sh') }}
+      - name: Fetch engine
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          TARGET: macos-arm64
+          CMAKE_BUILD_PARALLEL_LEVEL: '4'
+        run: |
+          set -euo pipefail
+          mkdir -p "engine-out/${TARGET}"
+          bash scripts/fetch_engine.sh "${TARGET}" "engine-out/${TARGET}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: engine-macos-arm64
+          path: engine-out/macos-arm64
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
   # Headless CLI (`dart compile exe`) bundled with the matching engine.
+  # `always() && !cancelled()` keeps each target independent of the engine
+  # matrix result; a missing artifact skips only that target (issue #50).
   # ---------------------------------------------------------------------------
   cli:
     name: Node CLI ${{ matrix.target }}
     needs: [meta, engine, cli-smoke]
-    if: needs.meta.outputs.has_engine == 'true' && needs.cli-smoke.outputs.working == 'true'
+    if: >-
+      always() && !cancelled() &&
+      needs.meta.outputs.has_engine == 'true' && needs.cli-smoke.outputs.working == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -195,19 +252,26 @@ jobs:
             os: ubuntu-24.04-arm
           - target: windows-x64
             os: windows-2022
-          - target: macos-arm64
-            os: macos-14
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dart-lang/setup-dart@v1
-        with:
-          sdk: stable
-      - uses: actions/download-artifact@v4
+      - name: Download engine
+        id: engine
+        continue-on-error: true
+        uses: actions/download-artifact@v4
         with:
           name: engine-${{ matrix.target }}
           path: engine-dist
+      - name: Notice missing engine
+        if: steps.engine.outcome != 'success'
+        shell: bash
+        run: echo "::notice::engine-${{ matrix.target }} was not produced; skipping the ${{ matrix.target }} CLI bundle"
+      - uses: dart-lang/setup-dart@v1
+        if: steps.engine.outcome == 'success'
+        with:
+          sdk: stable
       - name: Compile llmmbc_node
+        if: steps.engine.outcome == 'success'
         shell: bash
         working-directory: packages/llmmbc_core
         run: |
@@ -220,7 +284,7 @@ jobs:
             dart compile exe bin/llmmbc_node.dart -o "${GITHUB_WORKSPACE}/dist/llmmbc_node"
           fi
       - name: Package (unix)
-        if: runner.os != 'Windows'
+        if: steps.engine.outcome == 'success' && runner.os != 'Windows'
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
@@ -233,7 +297,7 @@ jobs:
           cp -a engine-dist/. "pkg/${name}/engine/"
           tar -czf "${name}.tar.gz" -C pkg "${name}"
       - name: Package (windows)
-        if: runner.os == 'Windows'
+        if: steps.engine.outcome == 'success' && runner.os == 'Windows'
         shell: pwsh
         env:
           TARGET: ${{ matrix.target }}
@@ -244,6 +308,7 @@ jobs:
           Copy-Item "engine-dist/*" "pkg/$name/engine/" -Recurse
           Compress-Archive -Path "pkg/$name/*" -DestinationPath "$name.zip"
       - uses: actions/upload-artifact@v4
+        if: steps.engine.outcome == 'success'
         with:
           name: llmmbc-node-${{ matrix.target }}
           path: |
@@ -252,33 +317,99 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  cli-macos:
+    name: Node CLI macos-arm64 (optional)
+    needs: [meta, engine-macos, cli-smoke]
+    if: >-
+      vars.LLMMBC_ENABLE_MACOS == 'true' && always() && !cancelled() &&
+      needs.meta.outputs.has_engine == 'true' && needs.cli-smoke.outputs.working == 'true'
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download engine
+        id: engine
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: engine-macos-arm64
+          path: engine-dist
+      - name: Notice missing engine
+        if: steps.engine.outcome != 'success'
+        shell: bash
+        run: echo "::notice::engine-macos-arm64 was not produced; skipping the macOS CLI bundle"
+      - uses: dart-lang/setup-dart@v1
+        if: steps.engine.outcome == 'success'
+        with:
+          sdk: stable
+      - name: Compile llmmbc_node
+        if: steps.engine.outcome == 'success'
+        shell: bash
+        working-directory: packages/llmmbc_core
+        run: |
+          set -euo pipefail
+          dart pub get
+          mkdir -p "${GITHUB_WORKSPACE}/dist"
+          dart compile exe bin/llmmbc_node.dart -o "${GITHUB_WORKSPACE}/dist/llmmbc_node"
+      - name: Package
+        if: steps.engine.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="llmmbc-node-macos-arm64"
+          mkdir -p "pkg/${name}/engine"
+          cp dist/llmmbc_node "pkg/${name}/llmmbc_node"
+          chmod 0755 "pkg/${name}/llmmbc_node"
+          cp -a engine-dist/. "pkg/${name}/engine/"
+          tar -czf "${name}.tar.gz" -C pkg "${name}"
+      - uses: actions/upload-artifact@v4
+        if: steps.engine.outcome == 'success'
+        with:
+          name: llmmbc-node-macos-arm64
+          path: llmmbc-node-macos-arm64.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
   # ---------------------------------------------------------------------------
-  # Flutter app bundles, one job per platform.
+  # Flutter app bundles, one job per platform. Each job survives a cancelled or
+  # failed engine leg and skips only when its own engine artifact is missing.
   # ---------------------------------------------------------------------------
   app-android:
     name: Android APK
     needs: [meta, engine]
-    if: needs.meta.outputs.has_app == 'true' && needs.meta.outputs.has_engine == 'true'
+    if: always() && !cancelled() && needs.meta.outputs.has_app == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - name: Download android-arm64 engine
+        id: engine_arm64
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: engine-android-arm64
+          path: engine/android-arm64
+      - name: Download android-x64 engine
+        id: engine_x64
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: engine-android-x64
+          path: engine/android-x64
+      - name: Notice missing engines
+        if: steps.engine_arm64.outcome != 'success' || steps.engine_x64.outcome != 'success'
+        shell: bash
+        run: echo "::notice::Android engine artifacts are incomplete; skipping the APK"
       - uses: actions/setup-java@v4
+        if: steps.engine_arm64.outcome == 'success' && steps.engine_x64.outcome == 'success'
         with:
           distribution: temurin
           java-version: '17'
       - uses: subosito/flutter-action@v2
+        if: steps.engine_arm64.outcome == 'success' && steps.engine_x64.outcome == 'success'
         with:
           channel: stable
           cache: true
-      - uses: actions/download-artifact@v4
-        with:
-          name: engine-android-arm64
-          path: engine/android-arm64
-      - uses: actions/download-artifact@v4
-        with:
-          name: engine-android-x64
-          path: engine/android-x64
       - name: Install engine native libraries
+        if: steps.engine_arm64.outcome == 'success' && steps.engine_x64.outcome == 'success'
         shell: bash
         run: |
           set -euo pipefail
@@ -308,14 +439,17 @@ jobs:
             done
           done
       - name: Build release APK (debug-signed when no keystore secret is configured)
+        if: steps.engine_arm64.outcome == 'success' && steps.engine_x64.outcome == 'success'
         working-directory: app
         run: |
           flutter pub get
           flutter build apk --release
       - name: Collect APK
+        if: steps.engine_arm64.outcome == 'success' && steps.engine_x64.outcome == 'success'
         shell: bash
         run: cp app/build/app/outputs/flutter-apk/app-release.apk llmmbc-android.apk
       - uses: actions/upload-artifact@v4
+        if: steps.engine_arm64.outcome == 'success' && steps.engine_x64.outcome == 'success'
         with:
           name: llmmbc-app-android
           path: llmmbc-android.apk
@@ -325,29 +459,40 @@ jobs:
   app-linux:
     name: Linux bundle
     needs: [meta, engine]
-    if: needs.meta.outputs.has_app == 'true' && needs.meta.outputs.has_engine == 'true'
+    if: always() && !cancelled() && needs.meta.outputs.has_app == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - name: Download engine
+        id: engine
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: engine-linux-x64
+          path: engine-dist
+      - name: Notice missing engine
+        if: steps.engine.outcome != 'success'
+        shell: bash
+        run: echo "::notice::engine-linux-x64 was not produced; skipping the Linux bundle"
       - uses: subosito/flutter-action@v2
+        if: steps.engine.outcome == 'success'
         with:
           channel: stable
           cache: true
       - name: Install Linux desktop build dependencies
+        if: steps.engine.outcome == 'success'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang cmake ninja-build pkg-config libgtk-3-dev
-      - uses: actions/download-artifact@v4
-        with:
-          name: engine-linux-x64
-          path: engine-dist
       - name: Build Linux bundle
+        if: steps.engine.outcome == 'success'
         working-directory: app
         run: |
           flutter config --enable-linux-desktop
           flutter pub get
           flutter build linux --release
       - name: Bundle engine and archive
+        if: steps.engine.outcome == 'success'
         shell: bash
         run: |
           set -euo pipefail
@@ -362,6 +507,7 @@ jobs:
           done
           tar -czf llmmbc-app-linux-x64.tar.gz -C "${bundle}" .
       - uses: actions/upload-artifact@v4
+        if: steps.engine.outcome == 'success'
         with:
           name: llmmbc-app-linux-x64
           path: llmmbc-app-linux-x64.tar.gz
@@ -371,25 +517,35 @@ jobs:
   app-windows:
     name: Windows bundle
     needs: [meta, engine]
-    if: needs.meta.outputs.has_app == 'true' && needs.meta.outputs.has_engine == 'true'
+    if: always() && !cancelled() && needs.meta.outputs.has_app == 'true'
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
-      - uses: subosito/flutter-action@v2
-        with:
-          channel: stable
-          cache: true
-      - uses: actions/download-artifact@v4
+      - name: Download engine
+        id: engine
+        continue-on-error: true
+        uses: actions/download-artifact@v4
         with:
           name: engine-windows-x64
           path: engine-dist
+      - name: Notice missing engine
+        if: steps.engine.outcome != 'success'
+        shell: bash
+        run: echo "::notice::engine-windows-x64 was not produced; skipping the Windows bundle"
+      - uses: subosito/flutter-action@v2
+        if: steps.engine.outcome == 'success'
+        with:
+          channel: stable
+          cache: true
       - name: Build Windows bundle
+        if: steps.engine.outcome == 'success'
         working-directory: app
         run: |
           flutter config --enable-windows-desktop
           flutter pub get
           flutter build windows --release
       - name: Bundle engine and archive
+        if: steps.engine.outcome == 'success'
         shell: pwsh
         run: |
           $bundle = "app/build/windows/x64/runner/Release"
@@ -400,6 +556,7 @@ jobs:
           }
           Compress-Archive -Path "$bundle/*" -DestinationPath "llmmbc-app-windows-x64.zip"
       - uses: actions/upload-artifact@v4
+        if: steps.engine.outcome == 'success'
         with:
           name: llmmbc-app-windows-x64
           path: llmmbc-app-windows-x64.zip
@@ -407,27 +564,37 @@ jobs:
           retention-days: 7
 
   app-macos:
-    name: macOS bundle
-    needs: [meta, engine]
-    if: needs.meta.outputs.has_app == 'true' && needs.meta.outputs.has_engine == 'true'
+    name: macOS bundle (optional)
+    needs: [meta, engine-macos]
+    if: vars.LLMMBC_ENABLE_MACOS == 'true' && always() && !cancelled() && needs.meta.outputs.has_app == 'true'
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-      - uses: subosito/flutter-action@v2
-        with:
-          channel: stable
-          cache: true
-      - uses: actions/download-artifact@v4
+      - name: Download engine
+        id: engine
+        continue-on-error: true
+        uses: actions/download-artifact@v4
         with:
           name: engine-macos-arm64
           path: engine-dist
+      - name: Notice missing engine
+        if: steps.engine.outcome != 'success'
+        shell: bash
+        run: echo "::notice::engine-macos-arm64 was not produced; skipping the macOS bundle"
+      - uses: subosito/flutter-action@v2
+        if: steps.engine.outcome == 'success'
+        with:
+          channel: stable
+          cache: true
       - name: Build macOS app
+        if: steps.engine.outcome == 'success'
         working-directory: app
         run: |
           flutter config --enable-macos-desktop
           flutter pub get
           flutter build macos --release
       - name: Bundle engine and archive
+        if: steps.engine.outcome == 'success'
         shell: bash
         run: |
           set -euo pipefail
@@ -446,6 +613,7 @@ jobs:
           done
           ditto -c -k --keepParent "${app}" llmmbc-app-macos-arm64.zip
       - uses: actions/upload-artifact@v4
+        if: steps.engine.outcome == 'success'
         with:
           name: llmmbc-app-macos-arm64
           path: llmmbc-app-macos-arm64.zip
@@ -455,7 +623,7 @@ jobs:
   app-ios:
     name: iOS unsigned (optional)
     needs: meta
-    if: needs.meta.outputs.has_app == 'true'
+    if: vars.LLMMBC_ENABLE_MACOS == 'true' && needs.meta.outputs.has_app == 'true'
     runs-on: macos-14
     # Optional per the delivery spec: an unsigned build failure must not block a release.
     continue-on-error: true
@@ -523,44 +691,109 @@ jobs:
             .
 
   # ---------------------------------------------------------------------------
-  # GitHub Release with every artifact produced above.
+  # GitHub Release. Publishes whenever at least one llmmbc-* artifact exists,
+  # even if some platform jobs were skipped, failed or cancelled (#50). Release
+  # notes list included and skipped platforms.
   # ---------------------------------------------------------------------------
   release:
     name: Publish GitHub Release
-    needs: [meta, cli-smoke, engine, cli, app-android, app-linux, app-windows, app-macos, app-ios, docker]
-    # Only publish a working, smoke-tested CLI; skipped/slow app jobs do not block it.
-    if: >-
-      always() && needs.meta.result == 'success' &&
-      needs.cli-smoke.result == 'success' && needs.cli-smoke.outputs.working == 'true' &&
-      needs.cli.result == 'success'
+    needs: [meta, cli-smoke, engine, engine-macos, cli, cli-macos, app-android, app-linux, app-windows, app-macos, app-ios, docker]
+    if: always() && !cancelled() && needs.meta.result == 'success'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - name: Download artifacts
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@v4
         with:
           path: dist
           pattern: llmmbc-*
           merge-multiple: true
-      - name: Check artifacts
-        id: check
+      - name: Build release notes
+        id: notes
         shell: bash
+        env:
+          TAG: ${{ needs.meta.outputs.tag }}
+          ENABLE_MACOS: ${{ vars.LLMMBC_ENABLE_MACOS }}
         run: |
           set -euo pipefail
-          count=$(find dist -type f | wc -l)
-          echo "found ${count} artifact file(s)"
-          find dist -type f -printf '%P\n' | sort
-          if [ "${count}" -eq 0 ]; then
-            echo "::notice::No artifacts available; skipping release publication"
+          mkdir -p dist
+          mapfile -t files < <(find dist -type f -printf '%f\n' | sort)
+          count=${#files[@]}
+          echo "found ${count} release artifact file(s)"
+          if ((count > 0)); then
+            printf '  %s\n' "${files[@]}"
+          fi
+
+          entries=(
+            "Headless CLI — linux-x64|llmmbc-node-linux-x64.tar.gz"
+            "Headless CLI — linux-arm64|llmmbc-node-linux-arm64.tar.gz"
+            "Headless CLI — windows-x64|llmmbc-node-windows-x64.zip"
+            "Android APK (arm64-v8a + x86_64)|llmmbc-android.apk"
+            "Linux app bundle (linux-x64)|llmmbc-app-linux-x64.tar.gz"
+            "Windows app bundle (windows-x64)|llmmbc-app-windows-x64.zip"
+          )
+          macos_entries=(
+            "Headless CLI — macOS arm64|llmmbc-node-macos-arm64.tar.gz"
+            "macOS app bundle (arm64)|llmmbc-app-macos-arm64.zip"
+            "iOS unsigned app|llmmbc-ios-unsigned.zip"
+          )
+          included=()
+          skipped=()
+          for entry in "${entries[@]}" "${macos_entries[@]}"; do
+            label=${entry%%|*}
+            file=${entry##*|}
+            if [[ -f "dist/${file}" ]]; then
+              included+=("${label}")
+            else
+              skipped+=("${label}")
+            fi
+          done
+
+          {
+            echo "## LLMMBC ${TAG}"
+            echo
+            echo "### Included platforms"
+            if ((${#included[@]})); then
+              printf -- '- %s\n' "${included[@]}"
+            else
+              echo "_None._"
+            fi
+            echo
+            echo "### Skipped platforms"
+            if ((${#skipped[@]})); then
+              printf -- '- %s\n' "${skipped[@]}"
+            else
+              echo "_None._"
+            fi
+            if [[ "${ENABLE_MACOS}" != "true" ]]; then
+              echo
+              echo "> macOS and unsigned iOS builds are disabled (LLMMBC_ENABLE_MACOS is not true)."
+            fi
+            echo
+            echo "### Assets"
+            if ((count > 0)); then
+              printf -- '- %s\n' "${files[@]}"
+            else
+              echo "_None._"
+            fi
+          } > release-notes.md
+          cat release-notes.md
+
+          if ((count == 0)); then
             echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No artifacts available; skipping release publication"
           else
             echo "found=true" >> "$GITHUB_OUTPUT"
           fi
       - name: Publish release
-        if: steps.check.outputs.found == 'true'
+        if: steps.notes.outputs.found == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.meta.outputs.tag }}
           name: ${{ needs.meta.outputs.tag }}
           prerelease: ${{ needs.meta.outputs.prerelease == 'true' }}
+          body_path: release-notes.md
           generate_release_notes: true
           files: dist/*
