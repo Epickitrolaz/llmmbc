@@ -32,6 +32,10 @@ services:
   node-a:
     <<: *node
     hostname: node-a
+    # Containers declare their role explicitly: serve options are overrides, so
+    # a plain serve keeps persisted settings (issues #59/#60).
+    environment:
+      LLMMBC_WORKER: "1"
     command:
       - >-
         llmmbc_node pull qwen3:0.6b &&
@@ -43,6 +47,8 @@ services:
   node-b:
     <<: *node
     hostname: node-b
+    environment:
+      LLMMBC_WORKER: "1"
     command:
       - >-
         llmmbc_node pull qwen3:0.6b &&
@@ -64,6 +70,8 @@ services:
   node-d:
     <<: *node
     hostname: node-d
+    environment:
+      LLMMBC_WORKER: "1"
     command:
       - exec llmmbc_node serve --name node-d
     volumes:

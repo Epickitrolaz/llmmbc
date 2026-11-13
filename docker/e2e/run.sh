@@ -288,6 +288,9 @@ toggle_node_b_worker() { # toggle_node_b_worker <0|1>
     "${COMPOSE_OFF[@]}" up -d --no-deps --force-recreate node-b
   else
     expected=true
+    # The base compose file declares LLMMBC_WORKER=1 explicitly; serve treats
+    # it as an override, so recreating without worker-off.yaml restores the
+    # worker role even though the persisted settings say workerEnabled=false.
     log "Worker toggle: restoring node-b as a worker"
     "${COMPOSE[@]}" up -d --no-deps --force-recreate node-b
   fi
