@@ -1,0 +1,14 @@
+# Build context pruning for docker/Dockerfile (BuildKit reads
+# <Dockerfile>.dockerignore). Keep the context small and deterministic.
+.git
+.gitignore
+.github
+**/.dart_tool
+**/.packages
+**/build
+**/.cache
+**/*.partial
+native/out
+native/src
+app/android/.gradle
+app/ios/Pods

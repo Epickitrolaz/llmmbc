@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Job-level `if` cannot call hashFiles(), so detect optional streams once.
+  prereq:
+    name: Check optional streams
+    runs-on: ubuntu-24.04
+    outputs:
+      core: ${{ steps.check.outputs.core }}
+      app: ${{ steps.check.outputs.app }}
+      scripts: ${{ steps.check.outputs.scripts }}
+      docker_scripts: ${{ steps.check.outputs.docker_scripts }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Detect optional paths
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "core=$([ -f packages/llmmbc_core/pubspec.yaml ] && echo true || echo false)"
+            echo "app=$([ -f app/pubspec.yaml ] && echo true || echo false)"
+            echo "scripts=$(compgen -G 'scripts/*.sh' >/dev/null && echo true || echo false)"
+            echo "docker_scripts=$([ -n "$(find docker -name '*.sh' -print -quit 2>/dev/null)" ] && echo true || echo false)"
+          } >> "$GITHUB_OUTPUT"
+
+  core-dart:
+    name: Core (dart analyze + test)
+    needs: prereq
+    # Skipped cleanly until the core package lands on the base branch.
+    if: needs.prereq.outputs.core == 'true'
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: packages/llmmbc_core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+      - name: dart pub get
+        run: dart pub get
+      - name: dart analyze
+        run: dart analyze
+      - name: dart test
+        run: dart test
+
+  app-flutter:
+    name: App (flutter analyze + test)
+    needs: prereq
+    # Skipped cleanly until the Flutter app lands on the base branch.
+    if: needs.prereq.outputs.app == 'true'
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: flutter pub get
+        run: flutter pub get
+      - name: flutter analyze
+        run: flutter analyze
+      - name: flutter test
+        run: |
+          if [ -d test ]; then
+            flutter test
+          else
+            echo "::notice::app/test does not exist yet; skipping flutter test"
+          fi
+
+  shellcheck:
+    name: Shellcheck
+    needs: prereq
+    if: needs.prereq.outputs.scripts == 'true' || needs.prereq.outputs.docker_scripts == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck scripts/*.sh
+        if: needs.prereq.outputs.scripts == 'true'
+        run: shellcheck -x scripts/*.sh
+      - name: shellcheck docker/**/*.sh
+        if: needs.prereq.outputs.docker_scripts == 'true'
+        run: find docker -name '*.sh' -exec shellcheck -x {} +
+
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install actionlint
+        run: |
+          curl -sSfL -o actionlint.tar.gz \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz
+          tar xzf actionlint.tar.gz actionlint
+          sudo install -m 0755 actionlint /usr/local/bin/actionlint
+      - name: actionlint
+        run: actionlint -color

@@ -1,0 +1,566 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Version / tag metadata and optional-stream detection shared by all jobs.
+  # Job-level `if` cannot call hashFiles(), hence the outputs below.
+  # ---------------------------------------------------------------------------
+  meta:
+    name: Resolve version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      has_engine: ${{ steps.version.outputs.has_engine }}
+      has_core: ${{ steps.version.outputs.has_core }}
+      has_app: ${{ steps.version.outputs.has_app }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve release tag
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=""
+          if [ -f packages/llmmbc_core/pubspec.yaml ]; then
+            version=$(awk '/^version:/{print $2; exit}' packages/llmmbc_core/pubspec.yaml)
+            version=${version%%+*}
+          fi
+          version=${version:-0.1.0}
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            tag="${GITHUB_REF_NAME}"
+            prerelease=false
+          else
+            tag="v${version}-build.${GITHUB_RUN_NUMBER}"
+            prerelease=true
+          fi
+          {
+            echo "version=${version}"
+            echo "tag=${tag}"
+            echo "prerelease=${prerelease}"
+            echo "has_engine=$([ -f scripts/fetch_engine.sh ] && echo true || echo false)"
+            echo "has_core=$([ -f packages/llmmbc_core/pubspec.yaml ] && echo true || echo false)"
+            echo "has_app=$([ -f app/pubspec.yaml ] && echo true || echo false)"
+          } >> "$GITHUB_OUTPUT"
+          echo "Release tag: ${tag} (prerelease=${prerelease})"
+
+  # ---------------------------------------------------------------------------
+  # A file-existence check is not enough: bin/llmmbc_node.dart exists on main as
+  # a contract stub that only throws. Every CLI/image/E2E job is gated on this
+  # smoke test actually producing HardwareProfile JSON.
+  # ---------------------------------------------------------------------------
+  cli-smoke:
+    name: CLI smoke test
+    needs: meta
+    if: needs.meta.outputs.has_core == 'true'
+    runs-on: ubuntu-24.04
+    outputs:
+      working: ${{ steps.smoke.outputs.working }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+      - name: Smoke-test llmmbc_node hw
+        id: smoke
+        shell: bash
+        working-directory: packages/llmmbc_core
+        run: |
+          set -euo pipefail
+          if [ ! -f bin/llmmbc_node.dart ]; then
+            echo "working=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Headless CLI missing; skipping CLI, Docker and release publication"
+            exit 0
+          fi
+          dart pub get
+          if ! out=$(dart run bin/llmmbc_node.dart hw); then
+            echo "working=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::llmmbc_node is not functional yet (hw exited non-zero); skipping CLI, Docker and release publication"
+            exit 0
+          fi
+          printf '%s\n' "${out}"
+          if [[ "${out}" != \{* ]] || ! grep -q '"totalRamBytes"' <<<"${out}"; then
+            echo "working=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::llmmbc_node hw did not print HardwareProfile JSON; skipping CLI, Docker and release publication"
+            exit 0
+          fi
+          echo "working=true" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # llama.cpp engine binaries, one job per target. Cached by LLAMA_CPP_VERSION.
+  # ---------------------------------------------------------------------------
+  engine:
+    name: Engine ${{ matrix.target }}
+    needs: meta
+    if: needs.meta.outputs.has_engine == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            os: ubuntu-24.04
+          - target: linux-arm64
+            os: ubuntu-24.04-arm
+          - target: windows-x64
+            os: windows-2022
+          - target: macos-arm64
+            os: macos-14
+          - target: android-arm64
+            os: ubuntu-24.04
+          - target: android-x64
+            os: ubuntu-24.04
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read LLAMA_CPP_VERSION
+        id: llama
+        shell: bash
+        run: |
+          if [ -f native/LLAMA_CPP_VERSION ]; then
+            value=$(tr -d '[:space:]' < native/LLAMA_CPP_VERSION)
+          else
+            value=unpinned
+            echo "::notice::native/LLAMA_CPP_VERSION is missing; engine cache key is not pinned"
+          fi
+          echo "value=${value}" >> "$GITHUB_OUTPUT"
+      - name: Cache engine build
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: engine-out/${{ matrix.target }}
+          key: engine-${{ matrix.target }}-${{ steps.llama.outputs.value }}-${{ hashFiles('scripts/build_engine.sh', 'scripts/fetch_engine.sh') }}
+      - name: Export Android NDK location
+        if: startsWith(matrix.target, 'android')
+        shell: bash
+        run: |
+          sdk="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          if [ -d "${sdk}/ndk" ]; then
+            ndk_name=$(find "${sdk}/ndk" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort -V | tail -n 1)
+            ndk_dir="${sdk}/ndk/${ndk_name}"
+            echo "ANDROID_NDK_HOME=${ndk_dir}" >> "$GITHUB_ENV"
+            echo "ANDROID_NDK_ROOT=${ndk_dir}" >> "$GITHUB_ENV"
+          else
+            echo "::notice::No Android NDK found; fetch_engine.sh must use its own toolchain for ${{ matrix.target }}"
+          fi
+      - name: Fetch engine
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          CMAKE_BUILD_PARALLEL_LEVEL: '4'
+        run: |
+          set -euo pipefail
+          mkdir -p "engine-out/${TARGET}"
+          if [ ! -f scripts/fetch_engine.sh ]; then
+            echo "::error::scripts/fetch_engine.sh is missing"
+            exit 1
+          fi
+          bash scripts/fetch_engine.sh "${TARGET}" "engine-out/${TARGET}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: engine-${{ matrix.target }}
+          path: engine-out/${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Headless CLI (`dart compile exe`) bundled with the matching engine.
+  # ---------------------------------------------------------------------------
+  cli:
+    name: Node CLI ${{ matrix.target }}
+    needs: [meta, engine, cli-smoke]
+    if: needs.meta.outputs.has_engine == 'true' && needs.cli-smoke.outputs.working == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            os: ubuntu-24.04
+          - target: linux-arm64
+            os: ubuntu-24.04-arm
+          - target: windows-x64
+            os: windows-2022
+          - target: macos-arm64
+            os: macos-14
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+      - uses: actions/download-artifact@v4
+        with:
+          name: engine-${{ matrix.target }}
+          path: engine-dist
+      - name: Compile llmmbc_node
+        shell: bash
+        working-directory: packages/llmmbc_core
+        run: |
+          set -euo pipefail
+          dart pub get
+          mkdir -p "${GITHUB_WORKSPACE}/dist"
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            dart compile exe bin/llmmbc_node.dart -o "${GITHUB_WORKSPACE}/dist/llmmbc_node.exe"
+          else
+            dart compile exe bin/llmmbc_node.dart -o "${GITHUB_WORKSPACE}/dist/llmmbc_node"
+          fi
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          name="llmmbc-node-${TARGET}"
+          mkdir -p "pkg/${name}/engine"
+          cp dist/llmmbc_node "pkg/${name}/llmmbc_node"
+          chmod 0755 "pkg/${name}/llmmbc_node"
+          cp -a engine-dist/. "pkg/${name}/engine/"
+          tar -czf "${name}.tar.gz" -C pkg "${name}"
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          $name = "llmmbc-node-$env:TARGET"
+          New-Item -ItemType Directory -Force -Path "pkg/$name/engine" | Out-Null
+          Copy-Item "dist/llmmbc_node.exe" "pkg/$name/llmmbc_node.exe"
+          Copy-Item "engine-dist/*" "pkg/$name/engine/" -Recurse
+          Compress-Archive -Path "pkg/$name/*" -DestinationPath "$name.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llmmbc-node-${{ matrix.target }}
+          path: |
+            llmmbc-node-${{ matrix.target }}.tar.gz
+            llmmbc-node-${{ matrix.target }}.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Flutter app bundles, one job per platform.
+  # ---------------------------------------------------------------------------
+  app-android:
+    name: Android APK
+    needs: [meta, engine]
+    if: needs.meta.outputs.has_app == 'true' && needs.meta.outputs.has_engine == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: engine-android-arm64
+          path: engine/android-arm64
+      - uses: actions/download-artifact@v4
+        with:
+          name: engine-android-x64
+          path: engine/android-x64
+      - name: Install engine native libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          copy_engine() {
+            src=$1
+            abi=$2
+            dst="app/android/app/src/main/jniLibs/${abi}"
+            mkdir -p "${dst}"
+            for f in "${src}/llama-server" "${src}/libllama_server.so"; do
+              if [ -f "${f}" ]; then cp "${f}" "${dst}/libllama_server.so"; break; fi
+            done
+            for f in "${src}/rpc-server" "${src}/librpc_server.so"; do
+              if [ -f "${f}" ]; then cp "${f}" "${dst}/librpc_server.so"; break; fi
+            done
+            find "${src}" -maxdepth 1 -name 'lib*.so' -exec cp {} "${dst}/" \;
+          }
+          copy_engine engine/android-arm64 arm64-v8a
+          copy_engine engine/android-x64 x86_64
+          for abi in arm64-v8a x86_64; do
+            dst="app/android/app/src/main/jniLibs/${abi}"
+            for lib in libllama_server.so librpc_server.so; do
+              if [ ! -f "${dst}/${lib}" ]; then
+                echo "::error::Missing ${lib} for ${abi} after engine install"
+                ls -la "${dst}" || true
+                exit 1
+              fi
+            done
+          done
+      - name: Build release APK (debug-signed when no keystore secret is configured)
+        working-directory: app
+        run: |
+          flutter pub get
+          flutter build apk --release
+      - name: Collect APK
+        shell: bash
+        run: cp app/build/app/outputs/flutter-apk/app-release.apk llmmbc-android.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llmmbc-app-android
+          path: llmmbc-android.apk
+          if-no-files-found: error
+          retention-days: 7
+
+  app-linux:
+    name: Linux bundle
+    needs: [meta, engine]
+    if: needs.meta.outputs.has_app == 'true' && needs.meta.outputs.has_engine == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Install Linux desktop build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang cmake ninja-build pkg-config libgtk-3-dev
+      - uses: actions/download-artifact@v4
+        with:
+          name: engine-linux-x64
+          path: engine-dist
+      - name: Build Linux bundle
+        working-directory: app
+        run: |
+          flutter config --enable-linux-desktop
+          flutter pub get
+          flutter build linux --release
+      - name: Bundle engine and archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle=app/build/linux/x64/release/bundle
+          mkdir -p "${bundle}/engine"
+          cp -a engine-dist/. "${bundle}/engine/"
+          for bin in llama-server rpc-server; do
+            if [ ! -x "${bundle}/engine/${bin}" ]; then
+              echo "::error::Missing executable engine/${bin} in the Linux bundle"
+              exit 1
+            fi
+          done
+          tar -czf llmmbc-app-linux-x64.tar.gz -C "${bundle}" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llmmbc-app-linux-x64
+          path: llmmbc-app-linux-x64.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  app-windows:
+    name: Windows bundle
+    needs: [meta, engine]
+    if: needs.meta.outputs.has_app == 'true' && needs.meta.outputs.has_engine == 'true'
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: engine-windows-x64
+          path: engine-dist
+      - name: Build Windows bundle
+        working-directory: app
+        run: |
+          flutter config --enable-windows-desktop
+          flutter pub get
+          flutter build windows --release
+      - name: Bundle engine and archive
+        shell: pwsh
+        run: |
+          $bundle = "app/build/windows/x64/runner/Release"
+          New-Item -ItemType Directory -Force -Path "$bundle/engine" | Out-Null
+          Copy-Item "engine-dist/*" "$bundle/engine/" -Recurse
+          foreach ($bin in @("llama-server.exe", "rpc-server.exe")) {
+            if (-not (Test-Path "$bundle/engine/$bin")) { throw "Missing engine/$bin in the Windows bundle" }
+          }
+          Compress-Archive -Path "$bundle/*" -DestinationPath "llmmbc-app-windows-x64.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llmmbc-app-windows-x64
+          path: llmmbc-app-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  app-macos:
+    name: macOS bundle
+    needs: [meta, engine]
+    if: needs.meta.outputs.has_app == 'true' && needs.meta.outputs.has_engine == 'true'
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: engine-macos-arm64
+          path: engine-dist
+      - name: Build macOS app
+        working-directory: app
+        run: |
+          flutter config --enable-macos-desktop
+          flutter pub get
+          flutter build macos --release
+      - name: Bundle engine and archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          app=$(find app/build/macos/Build/Products/Release -maxdepth 1 -name '*.app' | head -n 1)
+          if [ -z "${app}" ]; then
+            echo "::error::No macOS .app bundle produced"
+            exit 1
+          fi
+          mkdir -p "${app}/Contents/MacOS/engine"
+          cp -a engine-dist/. "${app}/Contents/MacOS/engine/"
+          for bin in llama-server rpc-server; do
+            if [ ! -x "${app}/Contents/MacOS/engine/${bin}" ]; then
+              echo "::error::Missing executable Contents/MacOS/engine/${bin} in the macOS bundle"
+              exit 1
+            fi
+          done
+          ditto -c -k --keepParent "${app}" llmmbc-app-macos-arm64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llmmbc-app-macos-arm64
+          path: llmmbc-app-macos-arm64.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  app-ios:
+    name: iOS unsigned (optional)
+    needs: meta
+    if: needs.meta.outputs.has_app == 'true'
+    runs-on: macos-14
+    # Optional per the delivery spec: an unsigned build failure must not block a release.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Build iOS (no codesign)
+        working-directory: app
+        run: |
+          flutter pub get
+          flutter build ios --release --no-codesign
+      - name: Package unsigned app
+        shell: bash
+        run: |
+          set -euo pipefail
+          app=$(find app/build/ios/iphoneos -maxdepth 1 -name '*.app' | head -n 1)
+          if [ -z "${app}" ]; then
+            echo "::error::No iOS .app bundle produced"
+            exit 1
+          fi
+          ditto -c -k --keepParent "${app}" llmmbc-ios-unsigned.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llmmbc-app-ios-unsigned
+          path: llmmbc-ios-unsigned.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Headless node container image -> GHCR.
+  # ---------------------------------------------------------------------------
+  docker:
+    name: Docker image (GHCR)
+    needs: [meta, cli-smoke]
+    if: needs.meta.outputs.has_engine == 'true' && needs.cli-smoke.outputs.working == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push
+        shell: bash
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/llmmbc-node"
+          tags=(-t "${image}:${VERSION}")
+          if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+            tags+=(-t "${image}:latest")
+          fi
+          docker buildx build \
+            --push \
+            --platform linux/amd64 \
+            --file docker/Dockerfile \
+            "${tags[@]}" \
+            .
+
+  # ---------------------------------------------------------------------------
+  # GitHub Release with every artifact produced above.
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish GitHub Release
+    needs: [meta, cli-smoke, engine, cli, app-android, app-linux, app-windows, app-macos, app-ios, docker]
+    # Only publish a working, smoke-tested CLI; skipped/slow app jobs do not block it.
+    if: >-
+      always() && needs.meta.result == 'success' &&
+      needs.cli-smoke.result == 'success' && needs.cli-smoke.outputs.working == 'true' &&
+      needs.cli.result == 'success'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: llmmbc-*
+          merge-multiple: true
+      - name: Check artifacts
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          count=$(find dist -type f | wc -l)
+          echo "found ${count} artifact file(s)"
+          find dist -type f -printf '%P\n' | sort
+          if [ "${count}" -eq 0 ]; then
+            echo "::notice::No artifacts available; skipping release publication"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Publish release
+        if: steps.check.outputs.found == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.meta.outputs.tag }}
+          name: ${{ needs.meta.outputs.tag }}
+          prerelease: ${{ needs.meta.outputs.prerelease == 'true' }}
+          generate_release_notes: true
+          files: dist/*

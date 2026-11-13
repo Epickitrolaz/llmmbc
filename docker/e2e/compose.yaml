@@ -1,0 +1,75 @@
+# Docker E2E cluster for the headless LLMMBC node.
+#
+# Four nodes on one bridge network (docs/ARCHITECTURE.md §2-§4):
+#   node-a  worker, has both test models
+#   node-b  worker, has both test models
+#   node-c  client-only (LLMMBC_WORKER=0), no models
+#   node-d  worker without any model (must never be a session candidate)
+#
+# Every worker pulls its own model copy into its own /data directory; there is
+# no shared read-only model volume. Cache directories live under
+# docker/e2e/.cache so CI can persist them between runs.
+name: llmmbc-e2e
+
+x-node: &node
+  image: llmmbc-node:e2e
+  build:
+    context: ../..
+    dockerfile: docker/Dockerfile
+  entrypoint: ["/bin/sh", "-c"]
+  init: true
+  restart: "no"
+  stop_grace_period: 15s
+  networks: [llmmbc]
+  healthcheck:
+    test: ["CMD", "curl", "-fsS", "http://127.0.0.1:47101/v1/node"]
+    interval: 10s
+    timeout: 5s
+    retries: 60
+    start_period: 15m
+
+services:
+  node-a:
+    <<: *node
+    hostname: node-a
+    command:
+      - >-
+        llmmbc_node pull qwen3:0.6b &&
+        llmmbc_node pull granite3.1-moe:1b &&
+        exec llmmbc_node serve --name node-a
+    volumes:
+      - "${LLMMBC_E2E_CACHE:-./.cache}/node-a:/data"
+
+  node-b:
+    <<: *node
+    hostname: node-b
+    command:
+      - >-
+        llmmbc_node pull qwen3:0.6b &&
+        llmmbc_node pull granite3.1-moe:1b &&
+        exec llmmbc_node serve --name node-b
+    volumes:
+      - "${LLMMBC_E2E_CACHE:-./.cache}/node-b:/data"
+
+  node-c:
+    <<: *node
+    hostname: node-c
+    environment:
+      LLMMBC_WORKER: "0"
+    command:
+      - exec llmmbc_node serve --name node-c
+    volumes:
+      - "${LLMMBC_E2E_CACHE:-./.cache}/node-c:/data"
+
+  node-d:
+    <<: *node
+    hostname: node-d
+    command:
+      - exec llmmbc_node serve --name node-d
+    volumes:
+      - "${LLMMBC_E2E_CACHE:-./.cache}/node-d:/data"
+
+networks:
+  llmmbc:
+    name: llmmbc
+    driver: bridge
