@@ -155,23 +155,24 @@ void main() {
   });
 
   group('memory option parsing', () {
-    test('defaults to total / 0.7', () {
-      expect(parseMemoryOptions(), const MemoryOptions());
-      expect(parseMemoryOptions().basis, MemoryBasis.total);
-      expect(parseMemoryOptions().share, kDefaultMemoryShare);
+    test('no flag or environment means no override', () {
+      final overrides = parseMemoryOverrides();
+      expect(overrides.isEmpty, isTrue);
+      expect(overrides.basis, isNull);
+      expect(overrides.share, isNull);
     });
 
     test('reads the environment', () {
-      final options = parseMemoryOptions(environment: {
+      final overrides = parseMemoryOverrides(environment: {
         'LLMMBC_MEMORY_BASIS': 'available',
         'LLMMBC_MEMORY_SHARE': '0.5',
       });
-      expect(options.basis, MemoryBasis.available);
-      expect(options.share, 0.5);
+      expect(overrides.basis, MemoryBasis.available);
+      expect(overrides.share, 0.5);
     });
 
     test('flags win over the environment', () {
-      final options = parseMemoryOptions(
+      final overrides = parseMemoryOverrides(
         basisFlag: 'total',
         shareFlag: '0.25',
         environment: {
@@ -179,8 +180,16 @@ void main() {
           'LLMMBC_MEMORY_SHARE': '0.5',
         },
       );
-      expect(options.basis, MemoryBasis.total);
-      expect(options.share, 0.25);
+      expect(overrides.basis, MemoryBasis.total);
+      expect(overrides.share, 0.25);
+    });
+
+    test('one field can be overridden without the other', () {
+      final overrides =
+          parseMemoryOverrides(basisFlag: 'available', environment: const {});
+      expect(overrides.basis, MemoryBasis.available);
+      expect(overrides.share, isNull);
+      expect(overrides.isEmpty, isFalse);
     });
 
     test('basis is case-insensitive', () {

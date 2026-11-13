@@ -7,6 +7,7 @@ import 'package:args/args.dart';
 import 'package:llmmbc_core/llmmbc_core.dart';
 import 'package:llmmbc_core/src/node/cli_memory.dart';
 import 'package:llmmbc_core/src/node/cli_progress.dart';
+import 'package:llmmbc_core/src/node/cli_serve.dart';
 import 'package:path/path.dart' as p;
 
 const String _kDefaultNode = 'http://127.0.0.1:47101';
@@ -15,19 +16,7 @@ Future<void> main(List<String> args) async {
   final parser = ArgParser();
   parser.addFlag('help', abbr: 'h', negatable: false, help: 'Show usage');
 
-  parser.addCommand('serve')
-    ..addOption('data-dir', help: 'Data directory')
-    ..addOption('name', help: 'Node display name')
-    ..addFlag('no-worker',
-        negatable: false, help: 'Do not lend compute to sessions')
-    ..addMultiOption('peer', help: 'Manual peer host:port', splitCommas: true)
-    ..addOption('port', defaultsTo: '$kNodeApiPort', help: 'Node API port')
-    ..addOption('memory-basis',
-        allowed: ['total', 'available'],
-        help: 'Memory the budget is based on (env LLMMBC_MEMORY_BASIS)')
-    ..addOption('memory-share',
-        help: 'Fraction (0..1] of that memory lent to sessions '
-            '(env LLMMBC_MEMORY_SHARE, default $kDefaultMemoryShare)');
+  parser.addCommand('serve', buildServeCommandParser());
 
   parser.addCommand('pull').addOption('data-dir', help: 'Data directory');
 
@@ -120,13 +109,9 @@ Future<void> _serve(ArgResults command) async {
   final env = Platform.environment;
   final settingsPath = p.join(dataDir, 'settings.json');
 
-  final MemoryOptions memory;
+  final ServeRequest request;
   try {
-    memory = parseMemoryOptions(
-      basisFlag: command['memory-basis'] as String?,
-      shareFlag: command['memory-share'] as String?,
-      environment: env,
-    );
+    request = serveRequestFromArgs(command, environment: env);
   } on FormatException catch (e) {
     throw LlmmbcException('bad_request', e.message);
   }
@@ -137,38 +122,17 @@ Future<void> _serve(ArgResults command) async {
     platform: const PlatformHooks(),
   );
 
-  var settings = service.settings;
-  final name = command['name'] as String? ?? env['LLMMBC_NAME'];
-  if (name != null && name.isNotEmpty) settings = settings.copyWith(name: name);
-
-  var workerEnabled = !(command['no-worker'] as bool);
-  final workerEnv = env['LLMMBC_WORKER'];
-  if (workerEnv != null) {
-    workerEnabled = workerEnv != '0' && workerEnv.toLowerCase() != 'false';
-  }
-  settings = settings.copyWith(workerEnabled: workerEnabled);
-
-  final port =
-      int.tryParse(command['port'] as String? ?? '') ?? settings.apiPort;
-  settings = settings.copyWith(apiPort: port);
-
-  final peers = <String>{
-    ...(command['peer'] as List<String>),
-    ...?(env['LLMMBC_PEERS']
-        ?.split(',')
-        .map((e) => e.trim())
-        .where((e) => e.isNotEmpty)),
-  };
-  settings = settings.copyWith(manualPeers: peers.toList());
-  settings =
-      settings.copyWith(memoryBasis: memory.basis, memoryShare: memory.share);
+  // Every serve option is an override: a plain serve keeps the persisted
+  // settings, explicit peers are merged with the persisted manual peers.
+  final settings = applyServeRequest(service.settings, request);
   await service.updateSettings(settings);
 
   final phases = service.startupPhase.listen((phase) {
     stdout.writeln('startup: $phase');
   });
 
-  stdout.writeln('llmmbc_node starting (data: $dataDir, api: $port)');
+  stdout.writeln('llmmbc_node starting (data: $dataDir, '
+      'api: ${service.settings.apiPort})');
   await service.start();
   stdout
       .writeln('node ${service.self.name} ${service.self.nodeId} listening on '

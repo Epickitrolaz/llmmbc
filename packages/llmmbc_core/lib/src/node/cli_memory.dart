@@ -3,32 +3,35 @@ import 'dart:io';
 
 import '../models.dart';
 
-/// Memory basis + share resolved from CLI flags and environment variables.
-class MemoryOptions {
-  final MemoryBasis basis;
-  final double share;
+/// Explicit memory overrides from CLI flags/environment. A null field means
+/// "not requested", so persisted settings stay untouched (issue #59).
+class MemoryOverrides {
+  final MemoryBasis? basis;
+  final double? share;
 
-  const MemoryOptions(
-      {this.basis = MemoryBasis.total, this.share = kDefaultMemoryShare});
+  const MemoryOverrides({this.basis, this.share});
+
+  bool get isEmpty => basis == null && share == null;
 
   @override
   bool operator ==(Object other) =>
-      other is MemoryOptions && other.basis == basis && other.share == share;
+      other is MemoryOverrides && other.basis == basis && other.share == share;
 
   @override
   int get hashCode => Object.hash(basis, share);
 
   @override
-  String toString() => 'MemoryOptions(${basis.name}, $share)';
+  String toString() => 'MemoryOverrides(${basis?.name}, $share)';
 }
 
 /// Resolves `--memory-basis` / `--memory-share` with `LLMMBC_MEMORY_BASIS` /
 /// `LLMMBC_MEMORY_SHARE` fallbacks.
 ///
-/// Precedence: flag, then environment, then the defaults (total / 0.7). Throws
-/// [FormatException] with a user-facing message for unknown or out-of-range
-/// values; the caller maps that to `bad_request`.
-MemoryOptions parseMemoryOptions({
+/// Both are overrides: when neither a flag nor the environment supplies a
+/// value the corresponding field is null and the persisted setting is kept.
+/// Throws [FormatException] with a user-facing message for unknown or
+/// out-of-range values; the caller maps that to `bad_request`.
+MemoryOverrides parseMemoryOverrides({
   String? basisFlag,
   String? shareFlag,
   Map<String, String> environment = const {},
@@ -37,9 +40,9 @@ MemoryOptions parseMemoryOptions({
       _firstNonEmpty(basisFlag, environment['LLMMBC_MEMORY_BASIS']);
   final shareRaw =
       _firstNonEmpty(shareFlag, environment['LLMMBC_MEMORY_SHARE']);
-  return MemoryOptions(
-    basis: basisRaw == null ? MemoryBasis.total : parseMemoryBasis(basisRaw),
-    share: shareRaw == null ? kDefaultMemoryShare : parseMemoryShare(shareRaw),
+  return MemoryOverrides(
+    basis: basisRaw == null ? null : parseMemoryBasis(basisRaw),
+    share: shareRaw == null ? null : parseMemoryShare(shareRaw),
   );
 }
 
