@@ -22,15 +22,24 @@ import 'gguf.dart';
 class FileModelStore implements ModelStore {
   /// [dataDir] is NodeSettings.dataDir; models live in `<dataDir>/models`.
   /// [registry] defaults to kOllamaRegistry (overridable for tests / mirrors).
-  FileModelStore(String dataDir, {GgufInspector inspector = const GgufReader(), String? registry})
-      : _dataDir = dataDir,
+  ///
+  /// [requestTimeout] bounds registry requests: waiting for response headers, an idle blob
+  /// body, and reading a manifest body. A stalled or hung registry therefore fails the pull
+  /// (or unblocks `cancel()`) instead of wedging the job forever.
+  FileModelStore(
+    String dataDir, {
+    GgufInspector inspector = const GgufReader(),
+    String? registry,
+    Duration requestTimeout = const Duration(seconds: 30),
+  })  : _dataDir = dataDir,
         _inspector = inspector,
-        _registryBase = _normalizeBase(registry ?? kOllamaRegistry);
+        _registryBase = _normalizeBase(registry ?? kOllamaRegistry),
+        _requestTimeout = requestTimeout;
 
   final String _dataDir;
   final GgufInspector _inspector;
   final String _registryBase;
-  final http.Client _client = http.Client();
+  final Duration _requestTimeout;
   final Map<String, _PullJob> _jobs = {};
   final Map<String, _CachedMetadata> _metadataCache = {};
   bool _metadataLoaded = false;
@@ -135,7 +144,11 @@ class FileModelStore implements ModelStore {
     final job = _jobs[ref.toString()];
     if (job == null) return;
     job.cancelled = true;
+    // Abort an in-flight blob body and any request still waiting for response headers.
     job.abort?.call();
+    job.client.close();
+    // Safe to await from a progress listener: `finished` completes before listener streams
+    // are closed (see _runPull's finally block).
     await job.finished.future;
   }
 
@@ -287,7 +300,7 @@ class FileModelStore implements ModelStore {
       if (job.cancelled) throw const _Cancelled();
 
       _emit(job, DownloadProgress(job.ref, DownloadState.resolving), force: true);
-      final manifest = await _fetchManifest(job.ref);
+      final manifest = await _fetchManifest(job.ref, job: job);
       if (job.cancelled) throw const _Cancelled();
       await _writeManifest(job.ref, manifest.raw);
 
@@ -350,15 +363,28 @@ class FileModelStore implements ModelStore {
               receivedBytes: job.current.receivedBytes, totalBytes: job.current.totalBytes),
           force: true);
     } catch (error) {
-      _emit(job,
-          DownloadProgress(job.ref, DownloadState.failed,
-              receivedBytes: job.current.receivedBytes,
-              totalBytes: job.current.totalBytes,
-              error: '$error'),
-          force: true);
+      if (job.cancelled) {
+        // Requests aborted by cancel() surface as client errors; report them as cancellation.
+        _emit(job,
+            DownloadProgress(job.ref, DownloadState.cancelled,
+                receivedBytes: job.current.receivedBytes, totalBytes: job.current.totalBytes),
+            force: true);
+      } else {
+        _emit(job,
+            DownloadProgress(job.ref, DownloadState.failed,
+                receivedBytes: job.current.receivedBytes,
+                totalBytes: job.current.totalBytes,
+                error: '$error'),
+            force: true);
+      }
     } finally {
       _jobs.remove(job.ref.toString());
       job.closed = true;
+      job.client.close();
+      // Complete waiters (cancel()) before awaiting listener shutdown. A listener may be
+      // inside `await store.cancel(ref)`: it cannot drain its stream (and let close() finish)
+      // until this future completes, which used to deadlock.
+      if (!job.finished.isCompleted) job.finished.complete();
       for (final listener in List<StreamController<DownloadProgress>>.of(job.listeners)) {
         try {
           await listener.close();
@@ -367,7 +393,6 @@ class FileModelStore implements ModelStore {
         }
       }
       job.listeners.clear();
-      if (!job.finished.isCompleted) job.finished.complete();
     }
   }
 
@@ -411,7 +436,7 @@ class FileModelStore implements ModelStore {
     var append = existing > 0;
     final request = http.Request('GET', _blobUri(ref, digest));
     if (append) request.headers[HttpHeaders.rangeHeader] = 'bytes=$existing-';
-    final response = await _client.send(request);
+    final response = await _sendRequest(job.client, request, job: job);
 
     if (response.statusCode == HttpStatus.ok) {
       // Server ignored Range: restart from zero.
@@ -446,8 +471,27 @@ class FileModelStore implements ModelStore {
     }
     final completer = Completer<void>();
     late StreamSubscription<List<int>> subscription;
+    Timer? idleTimer;
     var received = existing;
+
+    void cancelIdleTimer() {
+      idleTimer?.cancel();
+      idleTimer = null;
+    }
+
+    void resetIdleTimer() {
+      cancelIdleTimer();
+      idleTimer = Timer(_requestTimeout, () {
+        unawaited(subscription.cancel());
+        if (!completer.isCompleted) {
+          completer.completeError(
+              _PullFailure('blob $digest download stalled for ${_requestTimeout.inMilliseconds}ms'));
+        }
+      });
+    }
+
     job.abort = () {
+      cancelIdleTimer();
       unawaited(subscription.cancel());
       if (!completer.isCompleted) completer.completeError(const _Cancelled());
     };
@@ -455,27 +499,34 @@ class FileModelStore implements ModelStore {
     subscription = response.stream.listen(
       (chunk) {
         if (job.cancelled) {
+          cancelIdleTimer();
           unawaited(subscription.cancel());
           if (!completer.isCompleted) completer.completeError(const _Cancelled());
           return;
         }
+        resetIdleTimer();
         sink.add(chunk);
         received += chunk.length;
         onProgress(received);
       },
       onDone: () {
+        cancelIdleTimer();
         if (!completer.isCompleted) completer.complete();
       },
       onError: (Object error, StackTrace stackTrace) {
+        cancelIdleTimer();
         if (!completer.isCompleted) completer.completeError(error, stackTrace);
       },
       cancelOnError: true,
     );
+    // The body may never start after the headers arrive.
+    resetIdleTimer();
 
     try {
       await completer.future;
       await sink.flush();
     } finally {
+      cancelIdleTimer();
       job.abort = null;
       try {
         await sink.close();
@@ -508,39 +559,71 @@ class FileModelStore implements ModelStore {
   // Registry
   // -------------------------------------------------------------------------
 
-  Future<_Manifest> _fetchManifest(ModelRef ref) async {
-    final request = http.Request('GET', _manifestUri(ref))
-      ..headers[HttpHeaders.acceptHeader] = _manifestMediaType;
-    final http.StreamedResponse response;
+  Future<_Manifest> _fetchManifest(ModelRef ref, {_PullJob? job}) async {
+    final client = job?.client ?? http.Client();
+    final ownedClient = job == null;
     try {
-      response = await _client.send(request);
-    } catch (error) {
-      throw _PullFailure('could not reach registry for $ref: $error');
-    }
-    final body = await response.stream.bytesToString();
-    if (response.statusCode != HttpStatus.ok) {
-      throw _PullFailure('registry returned HTTP ${response.statusCode} for $ref');
-    }
-    final Object? decoded;
-    try {
-      decoded = jsonDecode(body);
-    } on FormatException {
-      throw _PullFailure('registry returned invalid JSON for $ref');
-    }
-    if (decoded is! Map<String, dynamic>) {
-      throw _PullFailure('registry returned an unexpected manifest for $ref');
-    }
-    final layers = <_Layer>[];
-    final rawLayers = decoded['layers'];
-    if (rawLayers is List) {
-      for (final item in rawLayers) {
-        if (item is! Map) continue;
-        final layer = _Layer.fromJson(Map<String, dynamic>.from(item));
-        if (layer.mediaType.isEmpty) continue;
-        layers.add(layer);
+      final request = http.Request('GET', _manifestUri(ref))
+        ..headers[HttpHeaders.acceptHeader] = _manifestMediaType;
+      final response = await _sendRequest(client, request, job: job);
+
+      final String body;
+      try {
+        body = await response.stream.bytesToString().timeout(_requestTimeout);
+      } on TimeoutException {
+        client.close();
+        throw _PullFailure(
+            'registry response for $ref stalled for ${_requestTimeout.inMilliseconds}ms');
+      } catch (error) {
+        if (job?.cancelled ?? false) throw const _Cancelled();
+        throw _PullFailure('could not read registry response for $ref: $error');
       }
+
+      if (response.statusCode != HttpStatus.ok) {
+        throw _PullFailure('registry returned HTTP ${response.statusCode} for $ref');
+      }
+      final Object? decoded;
+      try {
+        decoded = jsonDecode(body);
+      } on FormatException {
+        throw _PullFailure('registry returned invalid JSON for $ref');
+      }
+      if (decoded is! Map<String, dynamic>) {
+        throw _PullFailure('registry returned an unexpected manifest for $ref');
+      }
+      final layers = <_Layer>[];
+      final rawLayers = decoded['layers'];
+      if (rawLayers is List) {
+        for (final item in rawLayers) {
+          if (item is! Map) continue;
+          final layer = _Layer.fromJson(Map<String, dynamic>.from(item));
+          if (layer.mediaType.isEmpty) continue;
+          layers.add(layer);
+        }
+      }
+      return _Manifest(raw: decoded, layers: layers);
+    } finally {
+      if (ownedClient) client.close();
     }
-    return _Manifest(raw: decoded, layers: layers);
+  }
+
+  /// Sends a registry request, bounding the wait for response headers. A timeout closes the
+  /// (per-job) client so the socket cannot linger; cancellation is surfaced as [_Cancelled].
+  Future<http.StreamedResponse> _sendRequest(
+    http.Client client,
+    http.BaseRequest request, {
+    _PullJob? job,
+  }) async {
+    try {
+      return await client.send(request).timeout(_requestTimeout);
+    } on TimeoutException {
+      client.close();
+      throw _PullFailure(
+          'registry request timed out after ${_requestTimeout.inMilliseconds}ms');
+    } catch (error) {
+      if (job?.cancelled ?? false) throw const _Cancelled();
+      throw _PullFailure('could not reach registry: $error');
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -779,6 +862,8 @@ class _PullJob {
   final ModelRef ref;
   final Set<StreamController<DownloadProgress>> listeners = {};
   final Completer<void> finished = Completer<void>();
+  // One client per pull so cancel() can abort that job's request(s) without affecting others.
+  final http.Client client = http.Client();
   DownloadProgress current;
   DateTime? lastEmit;
   bool cancelled = false;
