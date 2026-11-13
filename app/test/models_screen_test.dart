@@ -1,5 +1,7 @@
+import 'package:app/dev/fake_node_service.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:llmmbc_core/llmmbc_core.dart';
 
 import 'helpers/test_app.dart';
 
@@ -81,6 +83,78 @@ void main() {
     await tester.pump(const Duration(milliseconds: 500));
     await tester.pumpAndSettle();
     expect(find.byKey(const Key('local-model-qwen3:30b-a3b')), findsOneWidget);
+  });
+
+  testWidgets('pulling a catalog model by name shows progress at the input and snacks', (tester) async {
+    final session = await testSession(
+      downloadTick: const Duration(milliseconds: 100),
+      verifyDuration: const Duration(milliseconds: 300),
+    );
+    await pumpApp(tester, session);
+    await openTab(tester, 'Models');
+
+    const ref = 'qwen3:30b-a3b';
+    await tester.enterText(find.byKey(const Key('models-pull-field')), ref);
+    await tester.tap(find.byKey(const Key('models-pull-button')));
+    await tester.pump();
+
+    // A snackbar confirms the action immediately…
+    expect(find.text('Pulling qwen3:30b-a3b…'), findsOneWidget);
+    // …and the Downloads card appears right below the field even though
+    // qwen3:0.6b also has a catalog row far down the list.
+    expect(find.text('Started from the name field above'), findsOneWidget);
+    final row = find.byKey(const Key('download-row-qwen3:30b-a3b'));
+    expect(row, findsOneWidget);
+    expect(
+      find.descendant(of: row, matching: find.byKey(const Key('download-state-qwen3:30b-a3b'))),
+      findsOneWidget,
+    );
+
+    await tester.pump(const Duration(milliseconds: 250));
+    expect(
+      find.descendant(of: row, matching: find.text('Downloading')),
+      findsOneWidget,
+    );
+    final percent = tester.widget<Text>(
+      find.descendant(of: row, matching: find.byKey(const Key('download-percent-qwen3:30b-a3b'))),
+    );
+    expect(RegExp(r'^\d+\.\d%$').hasMatch(percent.data!), isTrue);
+
+    await tester.pump(const Duration(seconds: 2));
+    await tester.pump(const Duration(milliseconds: 300));
+
+    expect(find.text('Downloaded qwen3:30b-a3b'), findsOneWidget);
+    expect(find.byKey(const Key('local-model-qwen3:30b-a3b')), findsOneWidget);
+    expect((await session.service.models.list()).any((m) => m.ref.toString() == ref), isTrue);
+  });
+
+  testWidgets('a failed by-name pull shows the error inline and in a snackbar', (tester) async {
+    final session = await testSessionWith(
+      FakeNodeService(pullFailure: LlmmbcException('network', 'registry unreachable')),
+    );
+    await pumpApp(tester, session);
+    await openTab(tester, 'Models');
+
+    await tester.enterText(find.byKey(const Key('models-pull-field')), 'qwen3:0.6b');
+    await tester.tap(find.byKey(const Key('models-pull-button')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+
+    expect(find.text('Download failed: registry unreachable'), findsOneWidget);
+    final row = find.byKey(const Key('download-row-qwen3:0.6b'));
+    expect(
+      find.descendant(of: row, matching: find.text('Failed')),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(of: row, matching: find.text('registry unreachable')),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(of: row, matching: find.byKey(const Key('download-btn-qwen3:0.6b'))),
+      findsOneWidget,
+      reason: 'a failed pull offers Retry next to the field',
+    );
   });
 
   testWidgets('download can be cancelled', (tester) async {

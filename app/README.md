@@ -69,7 +69,7 @@ out and shows it as "This device". `AppSession.refreshModels()` calls
 |---|---|
 | Startup | settings → hardware scan → model scan → node API → network scan progress, retry on failure |
 | Chat | `clusterModels()` picker with MoE/dense + candidate + cluster-memory badges, streamed Markdown answers, stop button, served-by + coordinator/worker session strip, JSON-persisted conversation list, error UX for `no_candidates` / `busy` / `does_not_fit` |
-| Models | MoE-first catalog, pull by name, per-model download stats (one-decimal %, downloaded/total, speed, ETA, Resolving/Downloading/Verifying x%/Done/Failed) with cancel/resume, local GGUF metadata, delete. Progress rebuilds are scoped to the row and throttled to 10 fps |
+| Models | MoE-first catalog, pull by name (progress appears inline under the field with start/failure/done snackbars), per-model download stats (one-decimal %, downloaded/total, speed, ETA, Resolving/Downloading/Verifying x%/Done/Failed) with cancel/resume, local GGUF metadata, delete. Progress rebuilds are scoped to the row and throttled to 10 fps |
 | Cluster | this device's `HardwareProfile` (RAM, CPU, GPUs, tags incl. `emulator`), session budget from `memoryBudgetBytes`, peers with status/worker mode/models/`effectiveBudgetBytes`, `discovery.scan()` refresh, add peer by `host:port` |
 | Settings | worker mode (default ON, forced OFF on iOS), node name, memory basis (Total RAM default / Free RAM estimate) with live budget preview, share slider, manual peers, data dir, engine availability + log tail, theme |
 

@@ -24,6 +24,10 @@ class _ModelsScreenState extends State<ModelsScreen> {
   final Map<String, DownloadThrottle> _downloads = {};
   final Map<String, StreamSubscription<DownloadProgress>> _subscriptions = {};
 
+  /// Refs started from the name field, in order, so their progress always has a
+  /// surface directly under the input (catalog rows can be far down the list).
+  final List<String> _namedPulls = [];
+
   late AppSession _session;
   bool _hydrated = false;
   bool _loading = true;
@@ -88,28 +92,42 @@ class _ModelsScreenState extends State<ModelsScreen> {
   DownloadThrottle _throttleFor(ModelRef ref) =>
       _downloads.putIfAbsent(ref.toString(), () => DownloadThrottle(ref));
 
-  /// Downloads started by name that have no catalog row of their own.
-  List<DownloadThrottle> get _orphanDownloads {
-    final catalogRefs = _catalog.map((entry) => entry.ref.toString()).toSet();
-    return [
-      for (final entry in _downloads.entries)
-        if (!catalogRefs.contains(entry.key) && entry.value.value != null) entry.value,
-    ];
+  /// Downloads started from the name field, in start order. Unlike the catalog
+  /// rows these are always rendered right below the field, whatever the model.
+  List<DownloadThrottle> get _namedDownloads => [
+        for (final key in _namedPulls)
+          if (_downloads[key]?.value != null) _downloads[key]!,
+      ];
+
+  /// Terminal state messages replace the transient "Pulling…" notice so the
+  /// user never has to wait for a queued snackbar.
+  void _notify(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(message)));
   }
 
-  void _startDownload(ModelRef ref) {
+  void _startDownload(ModelRef ref, {bool byName = false}) {
     final key = ref.toString();
+    if (byName && !_namedPulls.contains(key)) _namedPulls.add(key);
+    final named = _namedPulls.contains(key);
     _subscriptions.remove(key)?.cancel();
     final throttle = _throttleFor(ref);
     throttle.reset(DownloadProgress(ref, DownloadState.resolving));
     // Rebuild once so a by-name pull appears in the Downloads card; per-event
     // updates never call setState.
     setState(() => _pullError = null);
+    if (named) _notify('Pulling $key…');
     final subscription = _session.service.models.pull(ref).listen(
       (progress) {
         if (!mounted) return;
         throttle.push(progress);
-        if (progress.state == DownloadState.done || progress.state == DownloadState.failed) {
+        if (progress.state == DownloadState.done) {
+          if (named) _notify('Downloaded $key');
+          _load(force: true);
+        } else if (progress.state == DownloadState.failed) {
+          if (named) _notify('Download failed: ${progress.error ?? 'unknown error'}');
           _load(force: true);
         }
       },
@@ -124,6 +142,7 @@ class _ModelsScreenState extends State<ModelsScreen> {
           totalBytes: current?.totalBytes ?? 0,
           error: message,
         ));
+        if (named) _notify('Download failed: $message');
       },
       onDone: () => _subscriptions.remove(key),
     );
@@ -162,7 +181,7 @@ class _ModelsScreenState extends State<ModelsScreen> {
     }
     setState(() => _pullError = null);
     _pullField.clear();
-    _startDownload(ref);
+    _startDownload(ref, byName: true);
   }
 
   Future<void> _delete(LocalModel model) async {
@@ -240,11 +259,11 @@ class _ModelsScreenState extends State<ModelsScreen> {
                     onPull: _pullByName,
                   ),
                   const SizedBox(height: 16),
-                  if (_orphanDownloads.isNotEmpty) ...[
+                  if (_namedDownloads.isNotEmpty) ...[
                     _ActiveDownloadsCard(
-                      downloads: _orphanDownloads,
+                      downloads: _namedDownloads,
                       onCancel: _cancelDownload,
-                      onResume: _startDownload,
+                      onResume: (ref) => _startDownload(ref),
                     ),
                     const SizedBox(height: 16),
                   ],
@@ -672,7 +691,7 @@ class _ActiveDownloadsCard extends StatelessWidget {
     final theme = Theme.of(context);
     return PanelCard(
       title: 'Downloads',
-      subtitle: 'Pulled by name, outside the curated catalog',
+      subtitle: 'Started from the name field above',
       icon: Icons.downloading,
       child: Column(
         children: [
