@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:app/dev/fake_node_service.dart';
+
 import 'helpers/test_app.dart';
 
 void main() {
@@ -106,6 +108,41 @@ void main() {
     expect(tile.value, isFalse);
     expect(tile.onChanged, isNull);
     expect(find.textContaining('iOS cannot spawn'), findsOneWidget);
+  });
+
+  testWidgets('Android starts the worker foreground service without engine binaries', (tester) async {
+    final controller = FakeWorkerServiceController();
+    final session = await testSessionWith(
+      FakeNodeService(engineAvailable: false),
+      android: true,
+      workerService: controller,
+    );
+    await pumpApp(tester, session);
+    expect(controller.calls, isNotEmpty);
+    expect(controller.calls.last, isTrue);
+    expect(session.workerServiceActive, isTrue);
+
+    await openTab(tester, 'Settings');
+    expect(find.textContaining('Worker foreground service is running'), findsOneWidget);
+
+    await tapVisible(tester, find.byKey(const Key('worker-toggle')));
+    await tester.pumpAndSettle();
+    expect(controller.calls.last, isFalse);
+    expect(find.textContaining('no foreground service runs'), findsOneWidget);
+  });
+
+  testWidgets('denied POST_NOTIFICATIONS is explained accurately', (tester) async {
+    final controller = FakeWorkerServiceController(permitted: false);
+    final session = await testSessionWith(
+      FakeNodeService(),
+      android: true,
+      workerService: controller,
+    );
+    await pumpApp(tester, session);
+    await openTab(tester, 'Settings');
+
+    expect(session.notificationsAllowed, isFalse);
+    expect(find.textContaining('Notifications are disabled'), findsOneWidget);
   });
 
   testWidgets('degraded builds show the runtime notice', (tester) async {

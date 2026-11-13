@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import '../app/app_session.dart';
 import '../app/llmmbc_app.dart';
 import '../ui/widgets/common.dart';
+import '../ui/widgets/runtime_failure_banner.dart';
 
 class _Step {
   final String key;
@@ -155,11 +156,26 @@ class StartupScreen extends StatelessWidget {
                               ),
                             ],
                           ),
+                          if (session.runtimeFailure != null) ...[
+                            const SizedBox(height: 10),
+                            RuntimeFailureDetails(failure: session.runtimeFailure!),
+                          ],
                           const SizedBox(height: 12),
-                          FilledButton.icon(
-                            onPressed: () => session.start(retry: true),
-                            icon: const Icon(Icons.refresh),
-                            label: const Text('Retry startup'),
+                          Row(
+                            children: [
+                              FilledButton.icon(
+                                key: const Key('startup-retry'),
+                                onPressed: session.retryingRuntime ? null : session.retryRuntime,
+                                icon: session.retryingRuntime
+                                    ? const SizedBox(
+                                        width: 16,
+                                        height: 16,
+                                        child: CircularProgressIndicator(strokeWidth: 2),
+                                      )
+                                    : const Icon(Icons.refresh),
+                                label: Text(session.retryingRuntime ? 'Retrying…' : 'Retry startup'),
+                              ),
+                            ],
                           ),
                         ],
                       ),

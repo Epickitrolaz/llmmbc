@@ -12,7 +12,9 @@ import 'package:llmmbc_core/llmmbc_core.dart';
 ///  * `multicastLock(bool)` -> bool (WifiManager.MulticastLock acquire/release)
 ///  * `gpuRenderer` -> String?
 ///  * `deviceTags` -> List of strings (`["emulator"]`; not used by the core)
-///  * `startForeground` / `stopForeground` -> void (keeps the node alive as a worker)
+///  * `deviceName` -> String? (`Build.MODEL`, used for the first-run node name)
+///  * `requestNotificationPermission` -> bool (POST_NOTIFICATIONS on Android 13+)
+///  * `startForeground` / `stopForeground` -> bool (keeps the node alive as a worker)
 class PlatformBridge {
   PlatformBridge._();
 
@@ -43,6 +45,21 @@ class PlatformBridge {
     return _invoke<String>('gpuRenderer');
   }
 
+  /// Android `Build.MODEL`, e.g. `Pixel 8`. Null elsewhere.
+  static Future<String?> deviceName() async {
+    if (!isAndroid) return null;
+    final value = await _invoke<String>('deviceName');
+    final trimmed = value?.trim();
+    return trimmed == null || trimmed.isEmpty ? null : trimmed;
+  }
+
+  /// Requests POST_NOTIFICATIONS on Android 13+. True when notifications are
+  /// allowed (also true on platforms without the permission).
+  static Future<bool> requestNotificationPermission() async {
+    if (!isAndroid) return true;
+    return await _invoke<bool>('requestNotificationPermission') ?? false;
+  }
+
   /// Extra tags reported by Android (`emulator`). Missing on other platforms.
   static Future<List<String>> deviceTags() async {
     if (!isAndroid) return const [];
@@ -54,13 +71,16 @@ class PlatformBridge {
     }
   }
 
-  /// Keeps the process alive with a foreground notification while worker mode is on.
-  static Future<void> setWorkerNotification(bool enabled) async {
-    if (!isAndroid) return;
+  /// Starts/stops the foreground service that keeps the node reachable while
+  /// worker mode is on. Returns whether the service is now running as asked.
+  static Future<bool> setWorkerNotification(bool enabled) async {
+    if (!isAndroid) return false;
     try {
-      await channel.invokeMethod<void>(enabled ? 'startForeground' : 'stopForeground');
+      final running = await channel.invokeMethod<bool>(enabled ? 'startForeground' : 'stopForeground');
+      return running ?? false;
     } catch (_) {
-      // The node still runs while the app is in the foreground.
+      // Without a working channel the node still runs in the foreground.
+      return false;
     }
   }
 

@@ -1,6 +1,8 @@
-/// UI-only node service used when the core runtime is not wired up (stub build)
-/// or fails to start. It keeps the app usable and honest: real hardware data,
-/// persisted settings, manual peer probes, but no local engine and no downloads.
+/// UI-only node service used when the core runtime cannot be constructed or
+/// started. It keeps the app usable and honest: hardware profiling and the model
+/// catalog come from core (`LocalHardwareProbe`, `FileModelStore`), settings are
+/// persisted by the app, and manual peers are probed directly. There is no
+/// engine and no download path.
 library;
 
 import 'dart:async';
@@ -10,7 +12,7 @@ import 'dart:math';
 
 import 'package:llmmbc_core/llmmbc_core.dart';
 
-import 'local_hardware.dart';
+import 'node_naming.dart';
 
 String generateNodeId() {
   final random = Random.secure();
@@ -28,78 +30,69 @@ class DegradedNodeService implements NodeService {
     required this.settingsPath,
     required NodeSettings settings,
     required HardwareProfile hardware,
-    required PlatformHooks platform,
+    ModelStore? models,
   })  : _settings = settings,
-        _hardware = hardware,
-        _platform = platform {
+        _hardware = hardware {
+    _models = models ?? _DegradedModelStore(settings.dataDir);
     _discovery = _DegradedDiscovery(this);
   }
 
   final String settingsPath;
-  final PlatformHooks _platform;
   NodeSettings _settings;
   final HardwareProfile _hardware;
+  late final ModelStore _models;
   late final _DegradedDiscovery _discovery;
   final StreamController<String> _phases = StreamController<String>.broadcast();
   final StreamController<void> _changed = StreamController<void>.broadcast();
-  final ModelStore _models = _UnavailableModelStore();
   final InferenceEngine _engine = _UnavailableEngine();
   SessionInfo? _session;
 
   /// Creates the service, loading or creating `<settingsPath>`.
+  ///
+  /// [initialName] is the app's preferred first-run name (Android device model,
+  /// hostname fallback); generic stored names are replaced with it.
   static Future<DegradedNodeService> create({
     required String settingsPath,
     required String defaultDataDir,
     PlatformHooks platform = const PlatformHooks(),
+    String? initialName,
+    ModelStore? modelStore,
   }) async {
-    NodeSettings settings;
+    final preferred = (initialName ?? '').trim();
+    NodeSettings? settings;
     final file = File(settingsPath);
     if (file.existsSync()) {
       try {
         final decoded = jsonDecode(file.readAsStringSync());
         if (decoded is Map<String, dynamic>) {
           settings = NodeSettings.fromJson(decoded);
-        } else {
-          throw const FormatException('settings must be a JSON object');
         }
       } catch (_) {
-        settings = NodeSettings(
-          nodeId: generateNodeId(),
-          name: _defaultName(),
-          dataDir: defaultDataDir,
-          workerEnabled: !platform.clientOnly,
-        );
+        settings = null;
       }
-    } else {
-      settings = NodeSettings(
-        nodeId: generateNodeId(),
-        name: _defaultName(),
-        dataDir: defaultDataDir,
-        workerEnabled: !platform.clientOnly,
-      );
+    }
+    settings ??= NodeSettings(
+      nodeId: generateNodeId(),
+      name: preferred.isNotEmpty ? preferred : 'LLMMBC node',
+      dataDir: defaultDataDir,
+      workerEnabled: !platform.clientOnly,
+    );
+    if (preferred.isNotEmpty && isGenericNodeName(settings.name)) {
+      settings = settings.copyWith(name: preferred);
     }
     if (platform.clientOnly && settings.workerEnabled) {
       settings = settings.copyWith(workerEnabled: false);
     }
-    final hardware = await probeLocalHardware(hooks: platform);
+    // Core profiling lives in core-data; the app only supplies PlatformHooks.
+    final hardware = await LocalHardwareProbe(hooks: platform).scan();
     final service = DegradedNodeService._(
       settingsPath: settingsPath,
       settings: settings,
       hardware: hardware,
-      platform: platform,
+      models: modelStore,
     );
     service._persist();
     return service;
-  }
-
-  static String _defaultName() {
-    try {
-      final host = Platform.localHostname;
-      if (host.isNotEmpty && host != 'localhost') return host;
-    } catch (_) {
-      // ignore
-    }
-    return 'LLMMBC node';
   }
 
   void _persist() {
@@ -211,26 +204,20 @@ class DegradedNodeService implements NodeService {
     return Stream<ChatDelta>.error(
       LlmmbcException(
         'no_candidates',
-        'The local core runtime is unavailable in this build, so no node can run '
-            '${model.toString()}. Install the LLMMBC engine binaries and restart the app.',
+        'The core node runtime is unavailable, so no node can run ${model.toString()}. '
+            'Fix the error shown at the top of the app and retry.',
       ),
     );
   }
 
   @override
   SessionInfo? get currentSession => _session;
-
-  /// Not part of [NodeService]: the app uses this to explain the degraded mode.
-  bool get isDegraded => true;
-
-  /// Exposed for the Settings screen (no engine in this build).
-  PlatformHooks get platform => _platform;
 }
 
 class _UnavailableEngine implements InferenceEngine {
   @override
   Future<int> startRpcWorker({required int port, required String cacheDir}) async =>
-      throw LlmmbcException('engine_error', 'Engine binaries are not installed on this build.');
+      throw LlmmbcException('engine_error', 'The core node runtime is unavailable.');
 
   @override
   Future<void> stopRpcWorker() async {}
@@ -244,7 +231,7 @@ class _UnavailableEngine implements InferenceEngine {
     required ClusterPlan plan,
     required int port,
   }) async =>
-      throw LlmmbcException('engine_error', 'Engine binaries are not installed on this build.');
+      throw LlmmbcException('engine_error', 'The core node runtime is unavailable.');
 
   @override
   Future<void> stopCoordinator() async {}
@@ -256,63 +243,42 @@ class _UnavailableEngine implements InferenceEngine {
   List<String> get logTail => const [];
 }
 
-class _UnavailableModelStore implements ModelStore {
-  static const CatalogEntry _qwen = CatalogEntry(
-    ref: ModelRef('qwen3', tag: '0.6b'),
-    title: 'Qwen3 0.6B',
-    description: 'Tiny dense model, good for a first smoke test on one device.',
-    isMoe: false,
-    approxSizeBytes: 520 * 1024 * 1024,
-  );
+/// Model store for UI-only mode: core's catalog and local store layout, but no
+/// download path (the node cannot run anything without the runtime anyway).
+class _DegradedModelStore implements ModelStore {
+  _DegradedModelStore(String dataDir) : _store = FileModelStore(dataDir);
+
+  final FileModelStore _store;
 
   @override
-  String get modelsDir => '';
+  String get modelsDir => _store.modelsDir;
 
   @override
-  Future<List<LocalModel>> list() async => const [];
+  Future<List<LocalModel>> list() => _store.list();
 
   @override
-  Future<LocalModel?> find(ModelRef ref) async => null;
+  Future<LocalModel?> find(ModelRef ref) => _store.find(ref);
 
   @override
   Stream<DownloadProgress> pull(ModelRef ref) => Stream<DownloadProgress>.error(
-        LlmmbcException('internal', 'Model downloads need the core runtime, which is unavailable in this build.'),
+        LlmmbcException(
+          'internal',
+          'The core node runtime is unavailable, so downloads are disabled. '
+              'Fix the error shown at the top of the app and retry.',
+        ),
       );
 
   @override
   Future<void> cancel(ModelRef ref) async {}
 
   @override
-  Future<void> delete(ModelRef ref) async {}
+  Future<void> delete(ModelRef ref) => _store.delete(ref);
 
   @override
-  List<CatalogEntry> catalog() => const [
-        CatalogEntry(
-          ref: ModelRef('qwen3', tag: '30b-a3b'),
-          title: 'Qwen3 30B A3B',
-          description: 'Flagship MoE — 30B parameters, 3B active per token. Spreads well across phones.',
-          isMoe: true,
-          approxSizeBytes: 18 * 1024 * 1024 * 1024,
-        ),
-        CatalogEntry(
-          ref: ModelRef('granite3.1-moe', tag: '1b'),
-          title: 'Granite 3.1 MoE 1B',
-          description: 'Small MoE for planner and E2E checks (~1.4 GB).',
-          isMoe: true,
-          approxSizeBytes: 1400 * 1024 * 1024,
-        ),
-        CatalogEntry(
-          ref: ModelRef('mixtral', tag: '8x7b'),
-          title: 'Mixtral 8x7B',
-          description: 'Classic MoE, 8 experts with 2 active per token.',
-          isMoe: true,
-          approxSizeBytes: 26 * 1024 * 1024 * 1024,
-        ),
-        _qwen,
-      ];
+  List<CatalogEntry> catalog() => _store.catalog();
 
   @override
-  Future<int> remoteSize(ModelRef ref) async => 0;
+  Future<int> remoteSize(ModelRef ref) => _store.remoteSize(ref);
 }
 
 class _DegradedDiscovery implements Discovery {

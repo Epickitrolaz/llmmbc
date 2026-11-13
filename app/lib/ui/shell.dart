@@ -10,6 +10,7 @@ import 'cluster_screen.dart';
 import 'models_screen.dart';
 import 'settings_screen.dart';
 import 'widgets/common.dart';
+import 'widgets/runtime_failure_banner.dart';
 
 class _Tab {
   final String label;
@@ -86,7 +87,7 @@ class _HomeShellState extends State<HomeShell> {
                 child: Column(
                   children: [
                     _DesktopHeader(tab: _tabs[_index], session: session),
-                    notices,
+                    _NoticeArea(child: notices),
                     Expanded(child: body),
                   ],
                 ),
@@ -129,7 +130,14 @@ class _HomeShellState extends State<HomeShell> {
         ),
         actions: [StatusChips(session: session, compact: true), const SizedBox(width: 8)],
       ),
-      body: Column(children: [notices, Expanded(child: body)]),
+      body: Column(
+        children: [
+          // Error banners can grow (details); let them scroll instead of eating
+          // the screen content or overflowing on short displays.
+          _NoticeArea(child: notices),
+          Expanded(child: body),
+        ],
+      ),
       bottomNavigationBar: NavigationBar(
         selectedIndex: _index,
         onDestinationSelected: (index) => setState(() => _index = index),
@@ -260,6 +268,23 @@ class StatusChips extends StatelessWidget {
   }
 }
 
+/// Caps the height of the notice/banner stack (40% of the window) so a tall
+/// error details panel cannot squeeze or overflow the active screen.
+class _NoticeArea extends StatelessWidget {
+  const _NoticeArea({required this.child});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    final maxHeight = MediaQuery.sizeOf(context).height * 0.4;
+    return ConstrainedBox(
+      constraints: BoxConstraints(maxHeight: maxHeight, minHeight: 0),
+      child: SingleChildScrollView(child: child),
+    );
+  }
+}
+
 class _Notices extends StatelessWidget {
   const _Notices({required this.session});
 
@@ -268,7 +293,17 @@ class _Notices extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final notices = <Widget>[];
-    if (session.notice != null) {
+    final failure = session.runtimeFailure;
+    if (failure != null) {
+      notices.add(
+        RuntimeFailureBanner(
+          failure: failure,
+          retrying: session.retryingRuntime,
+          onRetry: session.retryRuntime,
+        ),
+      );
+    }
+    if (failure == null && session.notice != null) {
       notices.add(
         NoticeBanner(
           message: session.notice!,
@@ -276,7 +311,7 @@ class _Notices extends StatelessWidget {
           icon: Icons.warning_amber_outlined,
         ),
       );
-    } else if (session.fake) {
+    } else if (failure == null && session.fake) {
       notices.add(
         const NoticeBanner(
           message: 'Simulated cluster: peers, downloads and answers are generated locally '

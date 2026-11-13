@@ -41,6 +41,7 @@ class FakeNodeService implements NodeService {
     this.tokenDelay = const Duration(milliseconds: 14),
     this.downloadTick = const Duration(milliseconds: 60),
     this.scanLatency = const Duration(milliseconds: 350),
+    this.engineAvailable = true,
   }) {
     _models = _FakeModelStore(this);
     _discovery = _FakeDiscovery(this);
@@ -77,6 +78,9 @@ class FakeNodeService implements NodeService {
   final Duration tokenDelay;
   final Duration downloadTick;
   final Duration scanLatency;
+
+  /// Simulates a build without engine binaries (worker still runs the node API).
+  final bool engineAvailable;
 
   /// Set to throw from [chat] (tests and the error UX demo).
   Object? chatFailure;
@@ -137,7 +141,7 @@ class FakeNodeService implements NodeService {
         host: '192.168.1.31',
         apiPort: _settings.apiPort,
         workerEnabled: _settings.workerEnabled,
-        engineAvailable: true,
+        engineAvailable: engineAvailable,
         status: _session == null ? NodeStatus.worker : NodeStatus.coordinator,
         hardware: _hardware,
         models: List.unmodifiable(_localModels),

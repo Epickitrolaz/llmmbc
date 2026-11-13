@@ -1,7 +1,9 @@
 package dev.llmmbc.app
 
+import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.wifi.WifiManager
 import android.opengl.EGL14
 import android.opengl.GLES20
@@ -17,7 +19,9 @@ import io.flutter.plugin.common.MethodChannel
  */
 class MainActivity : FlutterActivity() {
     private val channelName = "dev.llmmbc/platform"
+    private val notificationPermissionRequest = 47102
     private var multicastLock: WifiManager.MulticastLock? = null
+    private var notificationPermissionResult: MethodChannel.Result? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -28,13 +32,15 @@ class MainActivity : FlutterActivity() {
                     "multicastLock" -> handleMulticastLock(call.arguments as? Boolean ?: false, result)
                     "gpuRenderer" -> result.success(gpuRenderer())
                     "deviceTags" -> result.success(deviceTags())
+                    "deviceName" -> result.success(deviceName())
+                    "requestNotificationPermission" -> requestNotificationPermission(result)
                     "startForeground" -> {
-                        startWorkerService()
-                        result.success(true)
+                        val started = startWorkerService()
+                        result.success(started)
                     }
                     "stopForeground" -> {
                         stopWorkerService()
-                        result.success(true)
+                        result.success(false)
                     }
                     else -> result.notImplemented()
                 }
@@ -124,12 +130,56 @@ class MainActivity : FlutterActivity() {
         return tags
     }
 
-    private fun startWorkerService() {
-        val intent = Intent(this, WorkerService::class.java)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(intent)
-        } else {
-            startService(intent)
+    /** Human readable device model used for the first-run node name. */
+    private fun deviceName(): String? {
+        val model = Build.MODEL?.trim().orEmpty()
+        if (model.isNotEmpty()) return model
+        val device = Build.DEVICE?.trim().orEmpty()
+        return device.ifEmpty { null }
+    }
+
+    /** POST_NOTIFICATIONS on Android 13+; older API levels are always allowed. */
+    private fun requestNotificationPermission(result: MethodChannel.Result) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            result.success(true)
+            return
+        }
+        if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) {
+            result.success(true)
+            return
+        }
+        if (notificationPermissionResult != null) {
+            // A request is already in flight; do not stack dialogs.
+            result.success(false)
+            return
+        }
+        notificationPermissionResult = result
+        requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), notificationPermissionRequest)
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != notificationPermissionRequest) return
+        val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
+        notificationPermissionResult?.success(granted)
+        notificationPermissionResult = null
+    }
+
+    private fun startWorkerService(): Boolean {
+        return try {
+            val intent = Intent(this, WorkerService::class.java)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(intent)
+            } else {
+                startService(intent)
+            }
+            true
+        } catch (_: Exception) {
+            false
         }
     }
 
