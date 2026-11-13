@@ -42,8 +42,8 @@ class FakeNodeService implements NodeService {
   FakeNodeService({
     this.phaseDelay = Duration.zero,
     this.tokenDelay = const Duration(milliseconds: 14),
-    this.downloadTick = const Duration(milliseconds: 60),
-    this.verifyDuration = const Duration(milliseconds: 800),
+    this.downloadTick = const Duration(milliseconds: 200),
+    this.verifyDuration = const Duration(milliseconds: 1600),
     this.scanLatency = const Duration(milliseconds: 350),
     this.engineAvailable = true,
   }) {
