@@ -43,6 +43,32 @@ void main() {
     expect(withGpu.usableMemoryBytes, 2 * gib - 256 * mib + 4 * gib);
   });
 
+  test('memory budget basis, settings migration and advertised budget (§2.5)', () {
+    const gib = 1 << 30;
+    const phone = HardwareProfile(
+        os: 'android', arch: 'arm64', cpuModel: '', cpuCores: 8, totalRamBytes: 12 * gib, availableRamBytes: 2 * gib);
+    expect(phone.memoryBudgetBytes(MemoryBasis.total, 0.7), (12 * gib * 0.7).floor());
+    expect(phone.memoryBudgetBytes(MemoryBasis.available, 0.7), (phone.usableMemoryBytes * 0.7).floor());
+
+    final legacy = NodeSettings.fromJson(
+        {'nodeId': 'n', 'name': 'n', 'dataDir': '/d', 'memoryShare': 0.8, 'workerEnabled': false});
+    expect(legacy.memoryShare, kDefaultMemoryShare);
+    expect(legacy.memoryBasis, MemoryBasis.total);
+    expect(legacy.workerEnabled, isFalse);
+    final custom = const NodeSettings(nodeId: 'n', name: 'n', dataDir: '/d')
+        .copyWith(memoryShare: 0.5, memoryBasis: MemoryBasis.available);
+    final rt = NodeSettings.fromJson(custom.toJson());
+    expect(rt.memoryShare, 0.5);
+    expect(rt.memoryBasis, MemoryBasis.available);
+
+    final info = NodeInfo(
+        nodeId: 'a', name: 'a', host: 'h', apiPort: 1, workerEnabled: true, engineAvailable: true,
+        status: NodeStatus.idle, hardware: phone, models: const [], memoryBudgetBytes: 5 * gib);
+    expect(NodeInfo.fromJson(info.toJson()).effectiveBudgetBytes, 5 * gib);
+    final old = info.toJson()..remove('memoryBudgetBytes');
+    expect(NodeInfo.fromJson(old).effectiveBudgetBytes, phone.usableMemoryBytes);
+  });
+
   test('candidate rule (§2.2) and NodeInfo JSON round-trip', () {
     const hw = HardwareProfile(
         os: 'linux',

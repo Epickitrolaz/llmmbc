@@ -46,7 +46,7 @@ nothing for that model (it may still act as a pure client that sends the chat re
 ### 2.3 Chat request flow
 1. Requester R lists models available in the cluster = union of `NodeInfo.models` over reachable
    nodes with `workerEnabled` (incl. self), grouped by model ref, with the candidate list.
-2. R picks the **coordinator** C = candidate with the largest `HardwareProfile.usableMemoryBytes`
+2. R picks the **coordinator** C = candidate with the largest `NodeInfo.effectiveBudgetBytes` (§2.5)
    (tie-break: lexicographically smallest `nodeId`). If C is busy with another model, R still sends
    to C (C answers 409 `busy` and R shows the error).
 3. R sends `POST /v1/chat/completions` (OpenAI format, `stream: true` supported) to C's node API.
@@ -69,6 +69,17 @@ nothing for that model (it may still act as a pure client that sends the chat re
   `--override-tensor <regex>=RPC[host:port]` so that each forward pass only touches the active experts'
   shards. The planner must always produce a plan whose per-node bytes ≤ that node's budget, or fail
   with `PlanError` ("model does not fit in cluster memory").
+
+### 2.5 Memory budget
+* Each node lends `budget = HardwareProfile.memoryBudgetBytes(settings.memoryBasis, settings.memoryShare)`:
+  * `total` basis (**default**): (total RAM + dedicated VRAM) × share. Phones keep most RAM "used"
+    by cached apps, so free-memory estimates badly understate what the OS can reclaim.
+  * `available` basis (opt-in): `usableMemoryBytes` (free RAM minus a small reserve, + VRAM) × share.
+  * Default share = 0.7. Settings files without `settingsVersion: 2` are migrated to total/0.7.
+* The node advertises `budget` as `NodeInfo.memoryBudgetBytes` (recomputed when settings or the
+  hardware refresh change), returns it as `budgetBytes` from `/v1/rpc/start`, and uses it as its own
+  `PlanNode.budgetBytes` when coordinating. Coordinator choice and UI totals use `effectiveBudgetBytes`.
+* CLI: `serve --memory-basis total|available --memory-share 0.7`; env `LLMMBC_MEMORY_BASIS`, `LLMMBC_MEMORY_SHARE`.
 
 ## 3. Wire protocol (node API, HTTP/1.1 JSON, TCP 47101)
 
@@ -123,6 +134,12 @@ timeout.
 * On-disk layout under `<dataDir>/models/`:
   `manifests/<ns>/<name>/<tag>.json` (raw manifest) and `blobs/sha256-<hex>` (content-addressed).
   Partial downloads: `blobs/sha256-<hex>.partial`, resumed with HTTP `Range`. sha256 verified before rename.
+* **Never block the calling isolate.** The digest is computed incrementally while bytes stream in
+  (no full re-read at the end). Hashing an existing `.partial` on resume, or any other full-file
+  hash, runs in a background isolate (`Isolate.run`) and reports `verifying` progress.
+* Progress (`DownloadProgress`): `receivedBytes/totalBytes` over all layers, `bytesPerSecond`
+  (smoothed over ~5 s), `eta`; at most ~10 events/s, always ≥ 1 `downloading` event and a final
+  `done`/`failed`/`cancelled`.
 * A model counts as downloaded only when the manifest file exists and every layer blob is complete.
 
 ## 6. Engine binaries

@@ -67,6 +67,17 @@ class HardwareProfile {
     return total;
   }
 
+  /// Sum of dedicated VRAM over all GPUs.
+  int get vramBytes => gpus.fold<int>(0, (a, g) => a + g.vramBytes);
+
+  /// Bytes this node lends to a session (docs/ARCHITECTURE.md §2.5):
+  /// `total` basis → (totalRam + VRAM) × share; `available` basis → usableMemoryBytes × share.
+  int memoryBudgetBytes(MemoryBasis basis, double share) {
+    final s = share.clamp(0.0, 1.0);
+    final base = basis == MemoryBasis.total ? totalRamBytes + vramBytes : usableMemoryBytes;
+    return (base * s).floor();
+  }
+
   Map<String, dynamic> toJson() => {
         'os': os,
         'arch': arch,
@@ -247,14 +258,27 @@ class CatalogEntry {
 
 enum DownloadState { queued, resolving, downloading, verifying, done, failed, cancelled }
 
+/// Pull progress. In `downloading`, received/total are bytes downloaded (all layers). In
+/// `verifying`, they are bytes hashed so far (0 when hashing was done incrementally during
+/// the download and nothing is left to check). See docs/ARCHITECTURE.md §5.
 class DownloadProgress {
   final ModelRef ref;
   final DownloadState state;
   final int receivedBytes;
   final int totalBytes;
   final String? error;
-  const DownloadProgress(this.ref, this.state, {this.receivedBytes = 0, this.totalBytes = 0, this.error});
-  double get fraction => totalBytes <= 0 ? 0 : receivedBytes / totalBytes;
+
+  /// Smoothed transfer rate (bytes/s) over the last few seconds; 0 when unknown.
+  final double bytesPerSecond;
+
+  /// Estimated time left for the current state; null when unknown.
+  final Duration? eta;
+  const DownloadProgress(this.ref, this.state,
+      {this.receivedBytes = 0, this.totalBytes = 0, this.error, this.bytesPerSecond = 0, this.eta});
+  double get fraction => totalBytes <= 0 ? 0 : (receivedBytes / totalBytes).clamp(0.0, 1.0);
+
+  /// 0..100.
+  double get percent => fraction * 100;
 }
 
 // ---------------------------------------------------------------------------
@@ -262,6 +286,19 @@ class DownloadProgress {
 // ---------------------------------------------------------------------------
 
 enum NodeStatus { idle, worker, coordinator, busy, offline }
+
+/// What `NodeSettings.memoryShare` is applied to (docs/ARCHITECTURE.md §2.5).
+enum MemoryBasis {
+  /// Whole host memory: (totalRam + VRAM) × share. Default.
+  total,
+
+  /// Currently free memory estimate: `HardwareProfile.usableMemoryBytes` × share.
+  available,
+}
+
+/// Current settings schema; files without `settingsVersion` (or older) are migrated.
+const int kSettingsVersion = 2;
+const double kDefaultMemoryShare = 0.7;
 
 class NodeSettings {
   final String nodeId;
@@ -272,8 +309,9 @@ class NodeSettings {
   final int apiPort;
   final List<String> manualPeers;
 
-  /// Max fraction (0..1] of usableMemoryBytes this node lends to a session.
+  /// Fraction (0..1] of the [memoryBasis] memory this node lends to a session.
   final double memoryShare;
+  final MemoryBasis memoryBasis;
 
   const NodeSettings({
     required this.nodeId,
@@ -283,7 +321,8 @@ class NodeSettings {
     this.engineDir,
     this.apiPort = kNodeApiPort,
     this.manualPeers = const [],
-    this.memoryShare = 0.8,
+    this.memoryShare = kDefaultMemoryShare,
+    this.memoryBasis = MemoryBasis.total,
   });
 
   NodeSettings copyWith({
@@ -294,6 +333,7 @@ class NodeSettings {
     int? apiPort,
     List<String>? manualPeers,
     double? memoryShare,
+    MemoryBasis? memoryBasis,
   }) =>
       NodeSettings(
         nodeId: nodeId,
@@ -304,9 +344,11 @@ class NodeSettings {
         apiPort: apiPort ?? this.apiPort,
         manualPeers: manualPeers ?? this.manualPeers,
         memoryShare: memoryShare ?? this.memoryShare,
+        memoryBasis: memoryBasis ?? this.memoryBasis,
       );
 
   Map<String, dynamic> toJson() => {
+        'settingsVersion': kSettingsVersion,
         'nodeId': nodeId,
         'name': name,
         'workerEnabled': workerEnabled,
@@ -315,17 +357,29 @@ class NodeSettings {
         'apiPort': apiPort,
         'manualPeers': manualPeers,
         'memoryShare': memoryShare,
+        'memoryBasis': memoryBasis.name,
       };
-  factory NodeSettings.fromJson(Map<String, dynamic> j) => NodeSettings(
-        nodeId: j['nodeId'] as String,
-        name: j['name'] as String,
-        dataDir: j['dataDir'] as String,
-        workerEnabled: j['workerEnabled'] as bool? ?? true,
-        engineDir: j['engineDir'] as String?,
-        apiPort: (j['apiPort'] as num?)?.toInt() ?? kNodeApiPort,
-        manualPeers: [for (final p in (j['manualPeers'] as List? ?? const [])) p as String],
-        memoryShare: (j['memoryShare'] as num?)?.toDouble() ?? 0.8,
-      );
+
+  /// Migration: settings written before version 2 had memoryShare 0.8 of free memory as
+  /// the default; they are reset to the new defaults (total basis, 70%).
+  factory NodeSettings.fromJson(Map<String, dynamic> j) {
+    final version = (j['settingsVersion'] as num?)?.toInt() ?? 1;
+    final migrate = version < 2;
+    return NodeSettings(
+      nodeId: j['nodeId'] as String,
+      name: j['name'] as String,
+      dataDir: j['dataDir'] as String,
+      workerEnabled: j['workerEnabled'] as bool? ?? true,
+      engineDir: j['engineDir'] as String?,
+      apiPort: (j['apiPort'] as num?)?.toInt() ?? kNodeApiPort,
+      manualPeers: [for (final p in (j['manualPeers'] as List? ?? const [])) p as String],
+      memoryShare:
+          migrate ? kDefaultMemoryShare : (j['memoryShare'] as num?)?.toDouble() ?? kDefaultMemoryShare,
+      memoryBasis: migrate
+          ? MemoryBasis.total
+          : MemoryBasis.values.asNameMap()[j['memoryBasis'] as String? ?? ''] ?? MemoryBasis.total,
+    );
+  }
 }
 
 /// Public description of a node, served at `GET /v1/node`.
@@ -348,6 +402,13 @@ class NodeInfo {
   /// Fully downloaded models (`ModelRef.toString()` + size + metadata).
   final List<LocalModel> models;
 
+  /// Bytes this node lends to a session per its settings (§2.5); 0 = not advertised
+  /// (older peer) → use [effectiveBudgetBytes].
+  final int memoryBudgetBytes;
+
+  /// Advertised budget, or the free-memory estimate for peers that don't advertise one.
+  int get effectiveBudgetBytes => memoryBudgetBytes > 0 ? memoryBudgetBytes : hardware.usableMemoryBytes;
+
   /// Observer-side fields (not sent by the node itself).
   final bool reachable;
   final bool isSelf;
@@ -365,6 +426,7 @@ class NodeInfo {
     required this.models,
     this.protocolVersion = kProtocolVersion,
     this.appVersion = '0.0.0',
+    this.memoryBudgetBytes = 0,
     this.reachable = true,
     this.isSelf = false,
     this.lastSeen,
@@ -389,6 +451,7 @@ class NodeInfo {
         status: status ?? this.status,
         hardware: hardware,
         models: models,
+        memoryBudgetBytes: memoryBudgetBytes,
         reachable: reachable ?? this.reachable,
         isSelf: isSelf ?? this.isSelf,
         lastSeen: lastSeen ?? this.lastSeen,
@@ -406,8 +469,10 @@ class NodeInfo {
         'status': status.name,
         'hardware': hardware.toJson(),
         'models': models.map((m) => m.toJson()).toList(),
+        'memoryBudgetBytes': memoryBudgetBytes,
       };
   factory NodeInfo.fromJson(Map<String, dynamic> j) => NodeInfo(
+        memoryBudgetBytes: (j['memoryBudgetBytes'] as num?)?.toInt() ?? 0,
         nodeId: j['nodeId'] as String,
         name: j['name'] as String,
         host: j['host'] as String? ?? '',
