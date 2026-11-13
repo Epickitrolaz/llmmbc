@@ -368,4 +368,68 @@ void main() {
       expect(discovery.peers.map((p) => p.nodeId), contains('manual-peer'));
     });
   });
+
+  group('peer identity (#49)', () {
+    test('an endpoint re-resolving to a new nodeId replaces the old peer',
+        () async {
+      final client = FakeNodeClient()
+        ..infoByPort[47101] =
+            nodeInfo('old-id', host: '127.0.0.1', apiPort: 47101);
+      final discovery = LanDiscovery(client: client, sweepEnabled: false);
+      addTearDown(discovery.stop);
+      await discovery.start(
+        () => nodeInfo('self'),
+        const NodeSettings(
+          nodeId: 'self',
+          name: 'self',
+          dataDir: '/tmp/d',
+          apiPort: 47101,
+          manualPeers: ['127.0.0.1:47101'],
+        ),
+      );
+      expect(discovery.peers.map((p) => p.nodeId), ['old-id']);
+
+      // The node restarted/reinstalled at the same address with a fresh id.
+      client.infoByPort[47101] =
+          nodeInfo('new-id', host: '127.0.0.1', apiPort: 47101);
+      await discovery.addManualPeer('127.0.0.1:47101');
+
+      expect(discovery.peers.map((p) => p.nodeId), ['new-id']);
+      expect(discovery.peers.single.apiPort, 47101);
+    });
+
+    test('replacing a manual peer by a new identity keeps manual semantics',
+        () async {
+      final clock = FakeClock(DateTime(2025, 1, 1));
+      final discovery = LanDiscovery(
+        client: FakeNodeClient(),
+        sweepEnabled: false,
+        now: () => clock.now,
+      );
+      addTearDown(discovery.stop);
+      await discovery.start(
+        () => nodeInfo('self'),
+        const NodeSettings(
+            nodeId: 'self', name: 'self', dataDir: '/tmp/d', apiPort: 47101),
+      );
+
+      discovery.debugSeedPeer(
+        nodeInfo('old-id', host: '127.0.0.1', apiPort: 47102),
+        manual: true,
+        lastSeen: clock.now,
+      );
+      // A beacon/sweep now resolves the same endpoint to a fresh identity.
+      discovery.debugUpsert(
+        nodeInfo('new-id', host: '127.0.0.1', apiPort: 47102),
+        host: '127.0.0.1',
+      );
+
+      expect(discovery.peers.map((p) => p.nodeId), ['new-id']);
+      // Manual peers are never dropped by maintenance; the replacement
+      // inherits that flag from the stale entry.
+      clock.advance(const Duration(minutes: 5));
+      discovery.debugRunMaintenance();
+      expect(discovery.peers.map((p) => p.nodeId), ['new-id']);
+    });
+  });
 }

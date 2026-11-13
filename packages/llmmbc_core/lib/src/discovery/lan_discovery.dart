@@ -419,18 +419,33 @@ class LanDiscovery implements Discovery {
   void _upsert(NodeInfo info, {required String host, required bool manual}) {
     if (info.nodeId == _selfId) return;
     final now = _now();
+
+    // A node that restarts or is reinstalled keeps its endpoint but reports a
+    // new nodeId. An endpoint has exactly one listener, so replace the stale
+    // identity instead of keeping both (#49). A manual peer stays manual across
+    // the identity change, otherwise maintenance would drop it later.
+    var effectiveManual = manual;
+    for (final id in _peers.keys.toList()) {
+      if (id == info.nodeId) continue;
+      final existing = _peers[id]!;
+      if (existing.info.host == host && existing.info.apiPort == info.apiPort) {
+        effectiveManual = effectiveManual || existing.manual;
+        _peers.remove(id);
+      }
+    }
+
     final previous = _peers[info.nodeId];
     final entry = previous ??
         _PeerEntry(
           info.copyWith(host: host, reachable: true, isSelf: false),
           now,
-          manual: manual,
+          manual: effectiveManual,
         );
     entry.info = info.copyWith(host: host, reachable: true, isSelf: false);
     entry.lastSeen = now;
     entry.lastFetched = now;
     entry.reachable = true;
-    entry.manual = entry.manual || manual;
+    entry.manual = entry.manual || effectiveManual;
     _peers[info.nodeId] = entry;
     _emitPeers();
   }
@@ -693,6 +708,11 @@ class LanDiscovery implements Discovery {
   void debugSeedPeer(NodeInfo info, {bool manual = false, DateTime? lastSeen}) {
     _peers[info.nodeId] = _PeerEntry(info, lastSeen ?? _now(), manual: manual);
   }
+
+  @visibleForTesting
+  void debugUpsert(NodeInfo info,
+          {required String host, bool manual = false}) =>
+      _upsert(info, host: host, manual: manual);
 
   @visibleForTesting
   void debugRunMaintenance() => _runMaintenance();
