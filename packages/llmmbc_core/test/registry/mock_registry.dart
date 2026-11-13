@@ -33,6 +33,9 @@ class MockRegistry {
   /// Send blob headers but never send the body (simulates a stalled download).
   bool stallBlobBody = false;
 
+  /// Answer blob requests with HTTP 500 and stall the error body (issue #26).
+  bool stallErrorBody = false;
+
   /// Responses intentionally left open by the stall knobs (closed by [close]).
   final List<HttpResponse> heldResponses = [];
 
@@ -112,6 +115,16 @@ class MockRegistry {
         final range = request.headers.value(HttpHeaders.rangeHeader);
         rangeHeaders.add(range);
         blobRequestCounts[hex] = (blobRequestCounts[hex] ?? 0) + 1;
+
+        if (stallErrorBody) {
+          response.statusCode = HttpStatus.internalServerError;
+          response.headers.contentType = ContentType.json;
+          response.headers.contentLength = 1000;
+          response.add(utf8.encode('{"errors":['));
+          await response.flush();
+          heldResponses.add(response);
+          return;
+        }
 
         final source = blobs[hex];
         if (source == null) {

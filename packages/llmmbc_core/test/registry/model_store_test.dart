@@ -227,7 +227,7 @@ void main() {
       states.add(progress.state);
       if (!cancelRequested &&
           progress.state == DownloadState.downloading &&
-          progress.receivedBytes > 0) {
+          progress.receivedBytes > 1024) {
         cancelRequested = true;
         unawaited(store.cancel(ref));
       }
@@ -349,6 +349,44 @@ void main() {
     expect(progress.last.error, contains('stalled'));
   });
 
+  test('pull fails when a blob error body stalls after an error status (#26)', () async {
+    addQwen();
+    registry.stallErrorBody = true;
+    final fast = FileModelStore(tempDir.path,
+        registry: registry.baseUrl, requestTimeout: const Duration(milliseconds: 250));
+
+    final progress = await fast
+        .pull(ModelRef.parse('qwen3:0.6b'))
+        .toList()
+        .timeout(const Duration(seconds: 3));
+
+    expect(progress.last.state, DownloadState.failed);
+    expect(progress.last.error, contains('stalled'));
+  });
+
+  test('cancel() aborts a stalled blob error body (#26)', () async {
+    addQwen();
+    registry.stallErrorBody = true;
+    final ref = ModelRef.parse('qwen3:0.6b');
+
+    final states = <DownloadState>[];
+    final eventsDone = Completer<void>();
+    store.pull(ref).listen(
+          (progress) => states.add(progress.state),
+          onDone: eventsDone.complete,
+        );
+
+    await waitFor(() => registry.blobRequests > 0);
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    final stopwatch = Stopwatch()..start();
+    await store.cancel(ref).timeout(const Duration(seconds: 2));
+    stopwatch.stop();
+    await eventsDone.future.timeout(const Duration(seconds: 2));
+
+    expect(stopwatch.elapsed, lessThan(const Duration(seconds: 2)));
+    expect(states.last, DownloadState.cancelled);
+  });
+
   test('concurrent pulls of the same ref share a single download', () async {
     final gguf = addQwen();
     registry.chunkDelay = const Duration(milliseconds: 5);
@@ -383,6 +421,16 @@ void main() {
     expect(downloadingEvents, lessThanOrEqualTo(10),
         reason: 'expected throttling, got $downloadingEvents of $chunks chunks');
     expect(events.last.state, DownloadState.done);
+  });
+
+  test('always emits a downloading event, even when the whole pull is instant', () async {
+    // Regression: on fast CI runners the throttle used to drop every downloading event
+    // between resolving and verifying for a small in-process download.
+    addQwen();
+    final states =
+        await store.pull(ModelRef.parse('qwen3:0.6b')).map((event) => event.state).toList();
+    expect(states, contains(DownloadState.downloading));
+    expect(states.last, DownloadState.done);
   });
 
   test('delete removes the manifest and garbage-collects unreferenced blobs', () async {
