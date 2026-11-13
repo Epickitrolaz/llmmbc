@@ -1,0 +1,22 @@
+name: llmmbc_core
+description: LLMMBC node runtime - hardware probe, model store, LAN discovery, node API, llama.cpp engine.
+version: 0.1.0
+publish_to: none
+
+environment:
+  sdk: ^3.5.0
+
+# Append-only: streams may ADD dependencies (docs/ARCHITECTURE.md §1).
+dependencies:
+  args: ^2.5.0
+  crypto: ^3.0.3
+  http: ^1.2.0
+  path: ^1.9.0
+  uuid: ^4.4.0
+
+dev_dependencies:
+  lints: ^4.0.0
+  test: ^1.25.0
+
+executables:
+  llmmbc_node:

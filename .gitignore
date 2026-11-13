@@ -1,0 +1,14 @@
+.dart_tool/
+build/
+.packages
+pubspec.lock
+!app/pubspec.lock
+native/out/
+native/src/
+*.partial
+.idea/
+.vscode/
+*.iml
+local.properties
+.flutter-plugins
+.flutter-plugins-dependencies
