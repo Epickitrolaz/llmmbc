@@ -26,6 +26,16 @@ void main() {
 
   String blobPath(String hex) => p.join(store.modelsDir, 'blobs', 'sha256-$hex');
 
+  Future<void> waitFor(bool Function() predicate,
+      {Duration timeout = const Duration(seconds: 3)}) async {
+    final deadline = DateTime.now().add(timeout);
+    while (!predicate()) {
+      if (DateTime.now().isAfter(deadline)) break;
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+    }
+    expect(predicate(), isTrue, reason: 'condition was not reached in time');
+  }
+
   setUp(() async {
     tempDir = await Directory.systemTemp.createTemp('llmmbc_store_');
     registry = MockRegistry();
@@ -84,6 +94,8 @@ void main() {
       expect(entry.approxSizeBytes, greaterThan(0));
       expect(entry.title, isNotEmpty);
       expect(entry.description, isNotEmpty);
+      // Contract fix #14: dotted names (llama3.2, granite3.1-moe) parse and round-trip.
+      expect(ModelRef.parse(entry.ref.toString()), entry.ref);
     }
   });
 
@@ -233,6 +245,108 @@ void main() {
     expect(resumed.last, DownloadState.done);
     expect(await partial.exists(), isFalse);
     expect(await File(blobPath(hex)).readAsBytes(), gguf);
+  });
+
+  test('cancel can be awaited from inside the progress listener (#15)', () async {
+    final gguf = addQwen();
+    final ref = ModelRef.parse('qwen3:0.6b');
+    final hex = _hex(gguf);
+    registry.chunkDelay = const Duration(milliseconds: 20);
+    registry.chunkSize = 1024;
+
+    final states = <DownloadState>[];
+    var cancelled = false;
+    await for (final progress in store.pull(ref)) {
+      states.add(progress.state);
+      if (!cancelled &&
+          progress.state == DownloadState.downloading &&
+          progress.receivedBytes > 1024) {
+        cancelled = true;
+        // Awaiting cancel() here used to deadlock: cancel waited for the pull stream to
+        // close, while the stream could not drain until this handler returned.
+        await store.cancel(ref).timeout(const Duration(seconds: 2));
+      }
+    }
+
+    expect(cancelled, isTrue);
+    expect(states.last, DownloadState.cancelled);
+    expect(await File('${blobPath(hex)}.partial').exists(), isTrue,
+        reason: 'cancelling keeps the partial for resume');
+  });
+
+  test('cancel() aborts a registry request stalled before response headers (#16)', () async {
+    addQwen();
+    registry.stallManifestResponses = true;
+    final ref = ModelRef.parse('qwen3:0.6b');
+
+    final states = <DownloadState>[];
+    final eventsDone = Completer<void>();
+    store.pull(ref).listen(
+          (progress) => states.add(progress.state),
+          onDone: eventsDone.complete,
+        );
+
+    await waitFor(() => registry.manifestRequests > 0);
+    final stopwatch = Stopwatch()..start();
+    await store.cancel(ref).timeout(const Duration(seconds: 2));
+    stopwatch.stop();
+    await eventsDone.future.timeout(const Duration(seconds: 2));
+
+    expect(stopwatch.elapsed, lessThan(const Duration(seconds: 2)),
+        reason: 'cancel must not wait for the registry socket');
+    expect(states.last, DownloadState.cancelled);
+  });
+
+  test('pull fails within the request timeout when the registry never responds (#16)', () async {
+    registry.stallManifestResponses = true;
+    final fast = FileModelStore(tempDir.path,
+        registry: registry.baseUrl, requestTimeout: const Duration(milliseconds: 250));
+
+    final progress = await fast
+        .pull(ModelRef.parse('qwen3:0.6b'))
+        .toList()
+        .timeout(const Duration(seconds: 3));
+
+    expect(progress.last.state, DownloadState.failed);
+    expect(progress.last.error, contains('timed out'));
+  });
+
+  test('cancel() aborts a blob body that stalls after the headers (#16)', () async {
+    addQwen();
+    registry.stallBlobBody = true;
+    final ref = ModelRef.parse('qwen3:0.6b');
+
+    final states = <DownloadState>[];
+    final eventsDone = Completer<void>();
+    store.pull(ref).listen(
+          (progress) => states.add(progress.state),
+          onDone: eventsDone.complete,
+        );
+
+    await waitFor(() => registry.blobRequests > 0);
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+    final stopwatch = Stopwatch()..start();
+    await store.cancel(ref).timeout(const Duration(seconds: 2));
+    stopwatch.stop();
+    await eventsDone.future.timeout(const Duration(seconds: 2));
+
+    expect(stopwatch.elapsed, lessThan(const Duration(seconds: 2)));
+    expect(states.last, DownloadState.cancelled);
+  });
+
+  test('pull fails when a blob body stalls after the headers (#16)', () async {
+    addQwen();
+    registry.stallBlobBody = true;
+    final fast = FileModelStore(tempDir.path,
+        registry: registry.baseUrl, requestTimeout: const Duration(milliseconds: 250));
+
+    final progress = await fast
+        .pull(ModelRef.parse('qwen3:0.6b'))
+        .toList()
+        .timeout(const Duration(seconds: 3));
+
+    expect(progress.last.state, DownloadState.failed);
+    expect(progress.last.error, contains('stalled'));
   });
 
   test('concurrent pulls of the same ref share a single download', () async {

@@ -27,6 +27,15 @@ class MockRegistry {
   bool supportsRange = true;
   bool corruptBlobs = false;
 
+  /// Accept the request but never send response headers (simulates a hung registry).
+  bool stallManifestResponses = false;
+
+  /// Send blob headers but never send the body (simulates a stalled download).
+  bool stallBlobBody = false;
+
+  /// Responses intentionally left open by the stall knobs (closed by [close]).
+  final List<HttpResponse> heldResponses = [];
+
   String get baseUrl => 'http://127.0.0.1:${_server!.port}';
 
   Future<void> start() async {
@@ -35,6 +44,14 @@ class MockRegistry {
   }
 
   Future<void> close() async {
+    for (final response in heldResponses) {
+      try {
+        await response.close();
+      } catch (_) {
+        // The client may already have gone away.
+      }
+    }
+    heldResponses.clear();
     await _server?.close(force: true);
   }
 
@@ -68,6 +85,10 @@ class MockRegistry {
           segments[3] == 'manifests') {
         manifestRequests++;
         final key = '${segments[1]}/${segments[2]}/${segments[4]}';
+        if (stallManifestResponses) {
+          heldResponses.add(response);
+          return;
+        }
         final json = manifests[key];
         if (json == null) {
           response.statusCode = HttpStatus.notFound;
@@ -120,6 +141,14 @@ class MockRegistry {
         }
         response.headers.contentType = ContentType.binary;
         response.headers.contentLength = data.length - start;
+        if (stallBlobBody) {
+          // Send a small prefix so the headers reach the client, then stall mid-body.
+          final end = min(start + 16, data.length);
+          response.add(data.sublist(start, end));
+          await response.flush();
+          heldResponses.add(response);
+          return;
+        }
         for (var offset = start; offset < data.length; offset += chunkSize) {
           if (chunkDelay > Duration.zero) await Future<void>.delayed(chunkDelay);
           response.add(data.sublist(offset, min(offset + chunkSize, data.length)));
