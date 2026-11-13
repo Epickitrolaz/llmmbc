@@ -106,14 +106,14 @@ void main() {
   });
 
   testWidgets('degraded mode disables chat with an explanation', (tester) async {
-    final session = await testSessionWith(
-      await DegradedNodeService.create(
+    final degraded = await tester.runAsync(
+      () => DegradedNodeService.create(
         settingsPath: '/tmp/llmmbc-test-degraded/settings.json',
         defaultDataDir: '/tmp/llmmbc-test-degraded',
+        modelStore: TestModelStore(entries: testCatalog),
       ),
-      fake: false,
-      degraded: true,
     );
+    final session = await testSessionWith(degraded!, fake: false, degraded: true);
     await pumpApp(tester, session);
 
     expect(find.textContaining('node runtime is unavailable'), findsWidgets);

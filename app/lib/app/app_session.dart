@@ -9,11 +9,9 @@ import 'package:flutter/material.dart';
 import 'package:llmmbc_core/llmmbc_core.dart';
 
 import '../models/conversation.dart';
-import '../services/platform_bridge.dart';
+import '../models/runtime_failure.dart';
 import '../services/store.dart';
-
-/// Startup steps of docs/ARCHITECTURE.md §2.1 as shown on the startup screen.
-const List<String> startupSteps = ['settings', 'hardware', 'models', 'network'];
+import '../services/worker_service.dart';
 
 class AppSession extends ChangeNotifier {
   AppSession({
@@ -23,15 +21,27 @@ class AppSession extends ChangeNotifier {
     this.fake = false,
     bool degraded = false,
     String? notice,
+    RuntimeFailure? runtimeFailure,
     bool clientOnly = false,
+    bool android = false,
     ThemeMode themeMode = ThemeMode.system,
-    Future<NodeService> Function()? degradedFallback,
+    Future<NodeService> Function()? degradedFactory,
+    Future<NodeService> Function()? runtimeFactory,
+    WorkerServiceController workerService = const PlatformWorkerServiceController(),
+    bool workerServiceActive = false,
+    bool notificationsAllowed = true,
   })  : _service = service,
         _degraded = degraded,
         _notice = notice,
+        _runtimeFailure = runtimeFailure,
         clientOnly = clientOnly || (fake == false && _isIos),
+        android = android,
         _themeMode = themeMode,
-        _degradedFallback = degradedFallback;
+        _degradedFactory = degradedFactory,
+        _runtimeFactory = runtimeFactory,
+        _worker = workerService,
+        _workerServiceActive = workerServiceActive,
+        _notificationsAllowed = notificationsAllowed;
 
   static bool get _isIos {
     try {
@@ -46,10 +56,20 @@ class AppSession extends ChangeNotifier {
   final AppPreferences prefs;
   final bool fake;
   final bool clientOnly;
-  final Future<NodeService> Function()? _degradedFallback;
+
+  /// True on Android builds (drives the worker foreground-service UI).
+  final bool android;
+
+  final Future<NodeService> Function()? _degradedFactory;
+  final Future<NodeService> Function()? _runtimeFactory;
+  final WorkerServiceController _worker;
 
   bool _degraded;
   String? _notice;
+  RuntimeFailure? _runtimeFailure;
+  bool _workerServiceActive;
+  bool _notificationsAllowed;
+  bool _retryingRuntime = false;
   ThemeMode _themeMode;
   bool _ready = false;
   bool _started = false;
@@ -64,6 +84,10 @@ class AppSession extends ChangeNotifier {
   NodeService get service => _service;
   bool get degraded => _degraded;
   String? get notice => _notice;
+  RuntimeFailure? get runtimeFailure => _runtimeFailure;
+  bool get retryingRuntime => _retryingRuntime;
+  bool get workerServiceActive => _workerServiceActive;
+  bool get notificationsAllowed => _notificationsAllowed;
   ThemeMode get themeMode => _themeMode;
   bool get ready => _ready;
   String? get startupError => _startupError;
@@ -112,8 +136,12 @@ class AppSession extends ChangeNotifier {
   Future<void> start({bool retry = false}) async {
     if (_started && !retry) return;
     _started = true;
-    _ready = false;
     _startupError = null;
+    await _startService();
+  }
+
+  Future<void> _startService() async {
+    _ready = false;
     _phases.clear();
     _phaseSub?.cancel();
     _changedSub?.cancel();
@@ -133,31 +161,101 @@ class AppSession extends ChangeNotifier {
     try {
       await _service.start();
       _ready = true;
-      if (PlatformBridge.isAndroid) {
-        await PlatformBridge.setWorkerNotification(
-          _service.settings.workerEnabled && !clientOnly && _service.self.engineAvailable,
-        );
-      }
-    } catch (error) {
-      final fallback = _degradedFallback;
-      if (!fake && !_degraded && fallback != null) {
+      if (!_degraded) _runtimeFailure = null;
+      _startupError = null;
+      await _syncWorkerService();
+    } catch (error, stack) {
+      final failure = RuntimeFailure.capture(
+        error,
+        stack,
+        phase: 'start',
+        logTail: _logTail(),
+      );
+      _runtimeFailure = failure;
+      final degradedFactory = _degradedFactory;
+      if (!fake && !_degraded && degradedFactory != null) {
         try {
-          final replacement = await fallback();
+          final replacement = await degradedFactory();
           _service = replacement;
           _degraded = true;
-          _notice ??= 'The core runtime failed to start; running in UI-only mode.';
-          await start(retry: true);
+          _notice = 'Core runtime failed to start: ${failure.summary}';
+          await _startService();
           return;
-        } catch (_) {
-          // Fall through to the visible error.
+        } catch (fallbackError, fallbackStack) {
+          _runtimeFailure = RuntimeFailure.capture(
+            fallbackError,
+            fallbackStack,
+            phase: 'fallback',
+            logTail: _logTail(),
+          );
         }
       }
       _startupError = error is UnimplementedError
           ? 'The node runtime is not available in this build.'
-          : error.toString();
+          : failure.summary;
     }
     await loadHistory();
     notifyListeners();
+  }
+
+  /// Rebuilds the real node runtime and starts it again; the degraded service
+  /// stays in place until the replacement starts successfully.
+  Future<void> retryRuntime() async {
+    if (_retryingRuntime) return;
+    _retryingRuntime = true;
+    _startupError = null;
+    notifyListeners();
+    try {
+      final runtimeFactory = _runtimeFactory;
+      if (runtimeFactory != null) {
+        final service = await runtimeFactory();
+        _service = service;
+        _degraded = false;
+        _notice = null;
+        _runtimeFailure = null;
+        _started = false;
+      }
+      _retryingRuntime = false;
+      await start(retry: true);
+    } catch (error, stack) {
+      _runtimeFailure = RuntimeFailure.capture(
+        error,
+        stack,
+        phase: 'retry',
+        logTail: _logTail(),
+      );
+      _retryingRuntime = false;
+      notifyListeners();
+    }
+  }
+
+  Future<void> _syncWorkerService() async {
+    if (!android) {
+      _workerServiceActive = false;
+      return;
+    }
+    // Keep the node (API + discovery) alive in the background; a degraded
+    // runtime has no node to keep alive, so no misleading notification.
+    final shouldRun = !_degraded && _service.settings.workerEnabled && !clientOnly;
+    if (!shouldRun) {
+      await _worker.setEnabled(false);
+      _workerServiceActive = false;
+      notifyListeners();
+      return;
+    }
+    final allowed = await _worker.requestNotificationPermission();
+    final running = await _worker.setEnabled(true);
+    _notificationsAllowed = allowed;
+    _workerServiceActive = running;
+    notifyListeners();
+  }
+
+  List<String> _logTail() {
+    try {
+      return List<String>.of(_service.engine.logTail);
+    } catch (_) {
+      return const [];
+    }
   }
 
   /// Peers without this node. `GET /v1/peers` and the discovery stream include
@@ -203,11 +301,7 @@ class AppSession extends ChangeNotifier {
 
   Future<void> updateSettings(NodeSettings settings) async {
     await _service.updateSettings(settings);
-    if (PlatformBridge.isAndroid) {
-      await PlatformBridge.setWorkerNotification(
-        settings.workerEnabled && !clientOnly && _service.self.engineAvailable,
-      );
-    }
+    await _syncWorkerService();
     notifyListeners();
   }
 

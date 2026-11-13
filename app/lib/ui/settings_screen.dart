@@ -2,8 +2,6 @@
 /// diagnostics.
 library;
 
-import 'dart:io';
-
 import 'package:llmmbc_core/llmmbc_core.dart';
 import 'package:flutter/material.dart';
 
@@ -175,15 +173,25 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           ),
                         ),
                       ),
-                      if (Platform.isAndroid && settings.workerEnabled && !clientOnly) ...[
+                      if (_session.android) ...[
                         const SizedBox(height: 10),
                         Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            Icon(Icons.notifications_active_outlined, size: 16, color: scheme.primary),
+                            Icon(
+                              settings.workerEnabled && !clientOnly
+                                  ? Icons.notifications_active_outlined
+                                  : Icons.notifications_off_outlined,
+                              size: 16,
+                              color: settings.workerEnabled && !clientOnly
+                                  ? scheme.primary
+                                  : scheme.onSurfaceVariant,
+                            ),
                             const SizedBox(width: 8),
                             Expanded(
                               child: Text(
-                                'A foreground notification keeps the node alive while worker mode is on.',
+                                _workerServiceCopy(_session, settings.workerEnabled && !clientOnly),
+                                key: const Key('worker-service-copy'),
                                 style: theme.textTheme.bodySmall?.copyWith(color: scheme.onSurfaceVariant),
                               ),
                             ),
@@ -415,6 +423,21 @@ class _SettingsScreenState extends State<SettingsScreen> {
       ],
     );
   }
+}
+
+String _workerServiceCopy(AppSession session, bool workerEnabled) {
+  if (!workerEnabled) {
+    return 'Worker mode is off: no foreground service runs and this node is not discovered.';
+  }
+  if (!session.workerServiceActive) {
+    return 'The worker foreground service is not running. Check app notifications and try toggling worker mode.';
+  }
+  if (!session.notificationsAllowed) {
+    return 'Worker foreground service is running. Notifications are disabled '
+        '(Android 13+ permission), so the persistent notification may be hidden.';
+  }
+  return 'Worker foreground service is running — the persistent notification keeps the node '
+      'discoverable and serving while the app is in the background.';
 }
 
 class _PathRow extends StatelessWidget {

@@ -32,6 +32,9 @@ flutter run --dart-define=LLMMBC_FAKE=1
 
 # Slow the simulated startup phases down (useful for demo screenshots)
 flutter run --dart-define=LLMMBC_FAKE=1 --dart-define=LLMMBC_FAKE_PHASE_MS=5000
+
+# QA the runtime-failure banner + Retry: the first runtime construction fails
+flutter run --dart-define=LLMMBC_SIMULATE_RUNTIME_FAILURE=1
 ```
 
 The default build wires:
@@ -44,12 +47,20 @@ LocalNodeService.create(
 )
 ```
 
-If `LocalNodeService` cannot be constructed (unsupported install) the app falls back to
-`DegradedNodeService`: it still shows the real hardware profile, persists settings and
-probes manual peers, but has no engine and no downloads. A banner says so. Peers reported
-by `GET /v1/peers` include this node itself; the UI filters it out and shows it as
-"This device". `AppSession.refreshModels()` calls `LocalNodeService.refreshModels()` so the
-Models screen reflects pulls/deletes immediately.
+First-run naming: core seeds `NodeSettings.name` from `Platform.localHostname` (which is
+`localhost` on Android). The app seeds/renames generic names to the Android `Build.MODEL`
+(read over the `dev.llmmbc/platform` channel) or the desktop hostname, so peers are
+distinguishable in the Cluster list, `servedBy` and `GET /v1/node`.
+
+If `LocalNodeService` cannot be constructed or started, the app falls back to
+`DegradedNodeService` and shows a `RuntimeFailureBanner` with the real error message, an
+expandable details dialog (phase, type, stack trace, engine log tail, copy button) and a
+working **Retry** that rebuilds the real runtime. The fallback uses core's
+`LocalHardwareProbe(hooks:)` and `FileModelStore` catalog — the app only supplies
+`PlatformHooks`, so degraded numbers match `GET /v1/node`. It has no engine and no
+downloads. Peers reported by `GET /v1/peers` include this node itself; the UI filters it
+out and shows it as "This device". `AppSession.refreshModels()` calls
+`LocalNodeService.refreshModels()` so the Models screen reflects pulls/deletes immediately.
 `--dart-define=LLMMBC_FAKE=1` always wins and uses `FakeNodeService`.
 
 ## Screens
@@ -69,8 +80,11 @@ Phones get a bottom navigation bar; widths ≥ 840 px get a navigation rail.
 * `MainActivity` implements the `dev.llmmbc/platform` MethodChannel:
   `nativeLibraryDir`, `multicastLock(bool)` (`WifiManager.MulticastLock`), `gpuRenderer`
   (EGL pbuffer), plus `deviceTags` (`emulator`) and `startForeground`/`stopForeground`.
-* `WorkerService` is a `dataSync` foreground service that keeps the node reachable while
-  worker mode is enabled.
+* `WorkerService` is a `dataSync` foreground service that keeps the node API and discovery
+  reachable while worker mode is enabled — independent of engine availability. It starts on
+  app startup and on every worker-mode change; `POST_NOTIFICATIONS` is requested on Android
+  13+ (`requestNotificationPermission`) and Settings reports whether the service and its
+  notification are actually running.
 * `minSdk 28`, `android:extractNativeLibs="true"`,
   `packaging.jniLibs.useLegacyPackaging = true` and cleartext HTTP for the LAN node API.
 * The APK builds without engine binaries; `jniLibs/<abi>/libllama_server.so` is added by
