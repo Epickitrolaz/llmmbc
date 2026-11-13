@@ -23,12 +23,20 @@ void main() {
         final ref = ModelRef.parse('qwen3:0.6b');
         final states = <DownloadState>[];
 
+        var lastReport = DateTime.fromMillisecondsSinceEpoch(0);
         await for (final progress in store.pull(ref)) {
-          if (states.isEmpty || states.last != progress.state) {
-            states.add(progress.state);
+          if (states.isEmpty || states.last != progress.state) states.add(progress.state);
+          // Print a progress line about twice a second, always for state changes.
+          final now = DateTime.now();
+          if (progress.state != DownloadState.downloading ||
+              now.difference(lastReport) >= const Duration(milliseconds: 500)) {
+            lastReport = now;
             stdout.writeln('live progress: ${progress.state.name} '
                 '${progress.receivedBytes}/${progress.totalBytes} '
-                '${progress.error ?? ''}'.trim());
+                '${progress.percent.toStringAsFixed(1)}% '
+                '${(progress.bytesPerSecond / (1 << 20)).toStringAsFixed(2)} MiB/s '
+                'eta ${progress.eta == null ? 'unknown' : '${progress.eta!.inSeconds}s'}'
+                '${progress.error == null ? '' : ' error=${progress.error}'}');
           }
         }
 
