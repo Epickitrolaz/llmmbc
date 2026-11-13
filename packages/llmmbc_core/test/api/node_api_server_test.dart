@@ -210,4 +210,75 @@ void main() {
           .having((e) => e.httpStatus, 'httpStatus', 403)),
     );
   });
+
+  test('chat defaults to a non-streaming JSON response (#23)', () async {
+    final dir = Directory.systemTemp.createTempSync('llmmbc_api_test');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    final service = LocalNodeService.internal(
+      settings: NodeSettings(
+          nodeId: 'self', name: 'self', dataDir: dir.path, apiPort: 0),
+      hardwareProbe: FakeHardwareProbe(hw()),
+      modelStore: FakeModelStore([localModel('qwen3:0.6b')]),
+      discovery: FakeDiscovery(),
+      client: FakeNodeClient(),
+      locator: FakeEngineLocator(),
+      engine: FakeEngine(),
+      planner: FakePlanner(),
+      settingsPath: '${dir.path}/settings.json',
+    );
+    addTearDown(service.stop);
+    await service.start();
+
+    final response = await http.post(
+      baseOf(service).resolve('/v1/chat/completions'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'model': 'qwen3:0.6b',
+        'messages': [
+          {'role': 'user', 'content': 'hi'}
+        ],
+      }),
+    );
+    expect(response.statusCode, 200);
+    expect(response.headers['content-type'], contains('application/json'));
+    final json = jsonDecode(response.body) as Map<String, dynamic>;
+    final choice = (json['choices'] as List).single as Map;
+    expect((choice['message'] as Map)['content'], 'Hello world');
+  });
+
+  test('pre-stream chat failures return an HTTP error, not 200 SSE (#23)',
+      () async {
+    final dir = Directory.systemTemp.createTempSync('llmmbc_api_test');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    final service = LocalNodeService.internal(
+      settings: NodeSettings(
+          nodeId: 'self', name: 'self', dataDir: dir.path, apiPort: 0),
+      hardwareProbe: FakeHardwareProbe(hw()),
+      modelStore: FakeModelStore(),
+      discovery: FakeDiscovery(),
+      client: FakeNodeClient(),
+      locator: FakeEngineLocator(),
+      engine: FakeEngine(),
+      planner: FakePlanner(),
+      settingsPath: '${dir.path}/settings.json',
+    );
+    addTearDown(service.stop);
+    await service.start();
+
+    final response = await http.post(
+      baseOf(service).resolve('/v1/chat/completions'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'model': 'qwen3:0.6b',
+        'messages': [
+          {'role': 'user', 'content': 'hi'}
+        ],
+        'stream': true,
+      }),
+    );
+    expect(response.statusCode, 403);
+    expect(response.headers['content-type'], contains('application/json'));
+    final json = jsonDecode(response.body) as Map<String, dynamic>;
+    expect((json['error'] as Map)['code'], 'not_candidate');
+  });
 }

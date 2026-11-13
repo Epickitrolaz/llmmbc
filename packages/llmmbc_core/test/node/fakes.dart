@@ -177,14 +177,29 @@ class FakeNodeClient implements NodeClient {
   ];
   LlmmbcException? startRpcError;
   SessionInfo? sessionResult;
+  int infoCalls = 0;
+  int concurrentInfoCalls = 0;
+  int maxConcurrentInfoCalls = 0;
+  Completer<void>? infoGate;
 
   @override
   Future<NodeInfo> info(Uri base, {Duration? timeout}) async {
-    final info = infoByPort[base.port];
-    if (info == null) {
-      throw LlmmbcException('not_found', 'no fake node on ${base.port}');
+    infoCalls++;
+    concurrentInfoCalls++;
+    if (concurrentInfoCalls > maxConcurrentInfoCalls) {
+      maxConcurrentInfoCalls = concurrentInfoCalls;
     }
-    return info.copyWith(host: info.host.isEmpty ? base.host : info.host);
+    try {
+      final gate = infoGate;
+      if (gate != null) await gate.future;
+      final info = infoByPort[base.port];
+      if (info == null) {
+        throw LlmmbcException('not_found', 'no fake node on ${base.port}');
+      }
+      return info.copyWith(host: info.host.isEmpty ? base.host : info.host);
+    } finally {
+      concurrentInfoCalls--;
+    }
   }
 
   @override
@@ -250,6 +265,11 @@ class FakeEngine implements InferenceEngine {
   HttpServer? _server;
   int rpcStarts = 0;
   int rpcStops = 0;
+  int concurrentRpcStarts = 0;
+  int maxConcurrentRpcStarts = 0;
+  Completer<void>? startRpcGate;
+  Completer<void>? stopCoordinatorGate;
+  Completer<void>? stopCoordinatorEntered;
   int coordinatorStarts = 0;
   int coordinatorStops = 0;
   LocalModel? lastModel;
@@ -265,8 +285,18 @@ class FakeEngine implements InferenceEngine {
   Future<int> startRpcWorker(
       {required int port, required String cacheDir}) async {
     rpcStarts++;
-    _rpc = true;
-    return port;
+    concurrentRpcStarts++;
+    if (concurrentRpcStarts > maxConcurrentRpcStarts) {
+      maxConcurrentRpcStarts = concurrentRpcStarts;
+    }
+    try {
+      final gate = startRpcGate;
+      if (gate != null) await gate.future;
+      _rpc = true;
+      return port;
+    } finally {
+      concurrentRpcStarts--;
+    }
   }
 
   @override
@@ -322,6 +352,10 @@ class FakeEngine implements InferenceEngine {
   @override
   Future<void> stopCoordinator() async {
     coordinatorStops++;
+    final entered = stopCoordinatorEntered;
+    if (entered != null && !entered.isCompleted) entered.complete();
+    final gate = stopCoordinatorGate;
+    if (gate != null) await gate.future;
     await _server?.close(force: true);
     _server = null;
   }

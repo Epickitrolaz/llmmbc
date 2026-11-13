@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:llmmbc_core/llmmbc_core.dart';
@@ -329,6 +330,43 @@ void main() {
       expect(h.service.self.status, NodeStatus.idle);
     });
 
+    test('serializes concurrent rpc starts: one wins, the other is busy (#17)',
+        () async {
+      final engine = FakeEngine()..startRpcGate = Completer<void>();
+      final h = buildHarness(
+        models: [localModel('qwen3:0.6b')],
+        engine: engine,
+      );
+      await h.service.start();
+      final model = ModelRef.parse('qwen3:0.6b');
+      final first = h.service.handleRpcStart(
+          sessionId: 'sess-A', model: model, coordinatorId: 'cA');
+      final second = h.service.handleRpcStart(
+          sessionId: 'sess-B', model: model, coordinatorId: 'cB');
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      engine.startRpcGate!.complete();
+
+      final results = await Future.wait([
+        first.then<Object>((value) => value, onError: (Object e) => e),
+        second.then<Object>((value) => value, onError: (Object e) => e),
+      ]);
+      var successes = 0;
+      final errors = <Object>[];
+      for (final result in results) {
+        if (result is LlmmbcException) {
+          errors.add(result);
+        } else {
+          successes++;
+        }
+      }
+      expect(successes, 1);
+      expect(errors, hasLength(1));
+      expect((errors.single as LlmmbcException).code, 'busy');
+      expect(engine.rpcStarts, 1);
+      expect(engine.maxConcurrentRpcStarts, 1);
+      expect(h.service.currentSession?.sessionId, 'sess-A');
+    });
+
     test('disabling worker mode stops the rpc worker immediately', () async {
       final h = buildHarness(models: [localModel('qwen3:0.6b')]);
       await h.service.start();
@@ -361,6 +399,52 @@ void main() {
   });
 
   group('coordinator session lifecycle', () {
+    test('warm session reuse does not re-scan discovery (#19)', () async {
+      final h = buildHarness(models: [localModel('qwen3:0.6b')]);
+      await h.service.start();
+      final model = ModelRef.parse('qwen3:0.6b');
+      await h.service.chat(model, [const ChatMessage('user', 'hi')]).toList();
+      expect(h.discovery.scans, 1);
+      await h.service
+          .chat(model, [const ChatMessage('user', 'again')]).toList();
+      await h.service
+          .chat(model, [const ChatMessage('user', 'again')]).toList();
+      expect(h.discovery.scans, 1);
+      expect(h.engine.coordinatorStarts, 1);
+    });
+
+    test('idle teardown cannot stop a newly started session (#18)', () async {
+      final engine = FakeEngine()
+        ..stopCoordinatorGate = Completer<void>()
+        ..stopCoordinatorEntered = Completer<void>();
+      final h = buildHarness(
+        hardware: hw(total: 16 << 30, available: 12 << 30),
+        models: [localModel('qwen3:0.6b')],
+        engine: engine,
+        idle: const Duration(milliseconds: 250),
+      );
+      await h.service.start();
+      final model = ModelRef.parse('qwen3:0.6b');
+      await h.service.chat(model, [const ChatMessage('user', 'hi')]).toList();
+
+      // Wait for the idle timer to enter the teardown, then start a new chat
+      // while the old teardown is still blocked.
+      await engine.stopCoordinatorEntered!.future
+          .timeout(const Duration(seconds: 3));
+      final next =
+          h.service.chat(model, [const ChatMessage('user', 'again')]).toList();
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      expect(engine.coordinatorStarts, 1);
+
+      engine.stopCoordinatorGate!.complete();
+      final deltas = await next.timeout(const Duration(seconds: 3));
+      expect(deltas.map((d) => d.content).join(), 'Hello world');
+      expect(h.service.currentSession, isNotNull);
+      expect(engine.coordinatorRunning, isTrue);
+      expect(engine.coordinatorStarts, 2);
+      expect(engine.coordinatorStops, 1);
+    });
+
     test(
         'plans with workers, starts the engine, proxies SSE and expires after idle',
         () async {

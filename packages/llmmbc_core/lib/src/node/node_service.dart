@@ -90,6 +90,8 @@ class LocalNodeService implements NodeService {
   _WorkerSession? _workerSession;
   _CoordinatorSession? _coordinatorSession;
   Future<void> _sessionQueue = Future.value();
+  DateTime? _lastDirectoryRefresh;
+  final Duration _directoryRefreshInterval;
 
   final StreamController<String> _phases = StreamController<String>.broadcast();
   final StreamController<void> _changed = StreamController<void>.broadcast();
@@ -108,6 +110,7 @@ class LocalNodeService implements NodeService {
     PlatformHooks platform = const PlatformHooks(),
     DateTime Function()? now,
     Duration sessionIdleTimeout = kSessionIdleTimeout,
+    Duration directoryRefreshInterval = const Duration(seconds: 3),
     http.Client? httpClient,
   })  : _settings = platform.clientOnly
             ? settings.copyWith(workerEnabled: false)
@@ -123,6 +126,7 @@ class LocalNodeService implements NodeService {
         _settingsPath = settingsPath,
         _now = now ?? DateTime.now,
         _idleTimeout = sessionIdleTimeout,
+        _directoryRefreshInterval = directoryRefreshInterval,
         _http = httpClient ?? http.Client(),
         _hardware = _fallbackHardware(),
         _apiPort = settings.apiPort;
@@ -234,9 +238,15 @@ class LocalNodeService implements NodeService {
       await _stopWorkerSession();
     }
     if (manualChanged) {
-      for (final peer in effective.manualPeers) {
-        unawaited(_discovery.addManualPeer(peer));
+      final discovery = _discovery;
+      if (discovery is LanDiscovery) {
+        discovery.setManualPeers(effective.manualPeers);
+      } else {
+        for (final peer in effective.manualPeers) {
+          unawaited(discovery.addManualPeer(peer));
+        }
       }
+      unawaited(discovery.scan());
     }
     _emitChanged();
   }
@@ -364,8 +374,10 @@ class LocalNodeService implements NodeService {
     } on Object {
       // ignore
     }
-    await _stopCoordinatorSession(notify: false);
-    await _stopWorkerSession(notify: false);
+    await _serialize(() async {
+      await _stopCoordinatorSessionLocked(notify: false);
+      await _stopWorkerSessionLocked(notify: false);
+    });
     await _api?.stop();
     _api = null;
     _changed.add(null);
@@ -432,6 +444,26 @@ class LocalNodeService implements NodeService {
     return nodes.where((n) => n.isCandidateFor(ref)).toList();
   }
 
+  Set<String> _candidateIdsFor(ModelRef ref) =>
+      {for (final c in _candidatesFor(ref)) c.nodeId};
+
+  bool _sameCandidateSet(Set<String> a, Set<String> b) =>
+      a.length == b.length && a.containsAll(b);
+
+  Future<void> _refreshDirectory() async {
+    final now = _now();
+    final last = _lastDirectoryRefresh;
+    if (last != null && now.difference(last) < _directoryRefreshInterval) {
+      return;
+    }
+    _lastDirectoryRefresh = now;
+    try {
+      await _discovery.scan().timeout(const Duration(seconds: 3));
+    } on Object {
+      // Keep the current directory when the refresh is slow or unsupported.
+    }
+  }
+
   NodeInfo _pickCoordinator(List<NodeInfo> candidates) {
     final sorted = [...candidates]..sort((a, b) {
         final byMemory = b.hardware.usableMemoryBytes
@@ -488,7 +520,24 @@ class LocalNodeService implements NodeService {
   }
 
   /// `POST /v1/rpc/start` handler: join a session as a worker.
+  ///
+  /// Serialized with coordinator session creation so the eligibility/busy check
+  /// and [InferenceEngine.startRpcWorker] are atomic: concurrent requests can
+  /// never both win, the loser sees `409 busy` (#17).
   Future<({String host, int port, int budgetBytes})> handleRpcStart({
+    required String sessionId,
+    required ModelRef model,
+    required String coordinatorId,
+    String? hostHint,
+  }) =>
+      _serialize(() => _handleRpcStart(
+            sessionId: sessionId,
+            model: model,
+            coordinatorId: coordinatorId,
+            hostHint: hostHint,
+          ));
+
+  Future<({String host, int port, int budgetBytes})> _handleRpcStart({
     required String sessionId,
     required ModelRef model,
     required String coordinatorId,
@@ -558,10 +607,13 @@ class LocalNodeService implements NodeService {
   }
 
   /// `POST /v1/rpc/stop` handler.
-  Future<void> handleRpcStop(String sessionId) async {
+  Future<void> handleRpcStop(String sessionId) =>
+      _serialize(() => _handleRpcStop(sessionId));
+
+  Future<void> _handleRpcStop(String sessionId) async {
     final worker = _workerSession;
     if (worker == null || worker.sessionId != sessionId) return;
-    await _stopWorkerSession();
+    await _stopWorkerSessionLocked();
   }
 
   Future<_CoordinatorSession> _ensureCoordinatorSession(ModelRef model) async {
@@ -576,28 +628,32 @@ class LocalNodeService implements NodeService {
           httpStatus: 409);
     }
 
-    // C's own view of the candidate set, refreshed (§2.3.4).
-    try {
-      await _discovery.scan().timeout(const Duration(seconds: 2));
-    } on Object {
-      // Keep the current directory when the refresh is slow or unsupported.
-    }
-
-    final candidates = _candidatesFor(model);
-    final candidateIds = {for (final c in candidates) c.nodeId};
     final previous = _coordinatorSession;
     if (previous != null &&
         previous.info.model == model &&
-        previous.candidateIds.length == candidateIds.length &&
-        previous.candidateIds.containsAll(candidateIds) &&
-        _engine.coordinatorRunning) {
+        _engine.coordinatorRunning &&
+        _sameCandidateSet(previous.candidateIds, _candidateIdsFor(model))) {
+      // Warm session: no discovery sweep on ordinary chat requests (#19).
+      return previous;
+    }
+
+    // Refresh C's own view of the candidate set only when the warm session
+    // cannot be reused (§2.3.4). The scan is coalesced and rate-limited (#19).
+    await _refreshDirectory();
+
+    final candidates = _candidatesFor(model);
+    final candidateIds = {for (final c in candidates) c.nodeId};
+    if (previous != null &&
+        previous.info.model == model &&
+        _engine.coordinatorRunning &&
+        _sameCandidateSet(previous.candidateIds, candidateIds)) {
       return previous;
     }
     if (candidates.isEmpty) {
       throw LlmmbcException('no_candidates', 'no node can run $model');
     }
 
-    await _stopCoordinatorSession(notify: false);
+    await _stopCoordinatorSessionLocked(notify: false);
 
     try {
       _hardware = await _hardwareProbe.refresh(_hardware);
@@ -712,20 +768,26 @@ class LocalNodeService implements NodeService {
         Timer(_idleTimeout, () => unawaited(_expireSession(session)));
   }
 
-  Future<void> _expireSession(_CoordinatorSession session) async {
-    if (!identical(_coordinatorSession, session)) return;
-    if (_now().difference(session.info.lastUsedAt) < _idleTimeout) {
-      _armIdleTimer();
-      return;
-    }
-    await _stopCoordinatorSession();
+  Future<void> _expireSession(_CoordinatorSession session) {
+    // Teardown shares the session queue with (re)creation. The identity and
+    // last-used checks run inside the queue so a teardown that lost the race to
+    // a new session can never stop the new engine (#18).
+    return _serialize(() async {
+      if (!identical(_coordinatorSession, session)) return;
+      if (_now().difference(session.info.lastUsedAt) < _idleTimeout) {
+        _armIdleTimer();
+        return;
+      }
+      await _stopCoordinatorSessionLocked();
+    });
   }
 
-  Future<void> _stopCoordinatorSession({bool notify = true}) async {
+  Future<void> _stopCoordinatorSessionLocked({bool notify = true}) async {
     final session = _coordinatorSession;
     if (session == null) return;
     _coordinatorSession = null;
     session.idleTimer?.cancel();
+    session.idleTimer = null;
     try {
       await _engine.stopCoordinator();
     } on Object {
@@ -745,7 +807,10 @@ class LocalNodeService implements NodeService {
     }
   }
 
-  Future<void> _stopWorkerSession({bool notify = true}) async {
+  Future<void> _stopWorkerSession({bool notify = true}) =>
+      _serialize(() => _stopWorkerSessionLocked(notify: notify));
+
+  Future<void> _stopWorkerSessionLocked({bool notify = true}) async {
     final worker = _workerSession;
     if (worker == null) return;
     _workerSession = null;

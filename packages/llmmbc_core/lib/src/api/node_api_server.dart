@@ -182,7 +182,8 @@ class NodeApiServer {
     }
     final temperature = (body['temperature'] as num?)?.toDouble();
     final maxTokens = (body['max_tokens'] as num?)?.toInt();
-    final stream = body['stream'] as bool? ?? true;
+    // OpenAI's default is `stream: false`.
+    final stream = body['stream'] as bool? ?? false;
 
     final deltas = _local.handleChat(model, messages,
         temperature: temperature, maxTokens: maxTokens);
@@ -195,6 +196,18 @@ class NodeApiServer {
 
   Future<void> _streamChat(
       HttpResponse response, ModelRef model, Stream<ChatDelta> deltas) async {
+    // Pull the first delta before committing to a 200/SSE response: errors from
+    // session setup or engine start must be regular §3 HTTP errors, not a 200
+    // with an SSE error payload (#23).
+    final iterator = StreamIterator<ChatDelta>(deltas);
+    final bool hasFirst;
+    try {
+      hasFirst = await iterator.moveNext();
+    } on Object {
+      await iterator.cancel();
+      rethrow;
+    }
+
     response.statusCode = HttpStatus.ok;
     response.headers.contentType =
         ContentType('text', 'event-stream', charset: 'utf-8');
@@ -203,27 +216,37 @@ class NodeApiServer {
     response.bufferOutput = false;
     final id = 'chatcmpl-${DateTime.now().microsecondsSinceEpoch}';
     final created = DateTime.now().millisecondsSinceEpoch ~/ 1000;
-    try {
-      await for (final delta in deltas) {
-        response.write(encodeOpenAiSseChunk(
+
+    String chunk(ChatDelta delta) => encodeOpenAiSseChunk(
           id: id,
           model: model.toString(),
           created: created,
           content: delta.content,
           finishReason: delta.finishReason,
-        ));
+        );
+
+    try {
+      if (hasFirst) {
+        response.write(chunk(iterator.current));
         await response.flush();
+        while (await iterator.moveNext()) {
+          response.write(chunk(iterator.current));
+          await response.flush();
+        }
       }
       response.write('data: [DONE]\n\n');
     } on LlmmbcException catch (e) {
+      // The stream already started; surface the failure as an SSE error event.
       response.write('data: ${jsonEncode(e.toJson())}\n\n');
       response.write('data: [DONE]\n\n');
     } catch (e) {
       response.write(
           'data: ${jsonEncode(LlmmbcException('engine_error', e.toString()).toJson())}\n\n');
       response.write('data: [DONE]\n\n');
+    } finally {
+      await iterator.cancel();
+      await response.close();
     }
-    await response.close();
   }
 
   Future<void> _bufferedChat(

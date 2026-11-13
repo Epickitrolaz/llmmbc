@@ -100,6 +100,111 @@ void main() {
     expect(peer.apiPort, server.port);
   }, timeout: const Timeout(Duration(seconds: 60)));
 
+  test('scan is single-flight and keeps sweep concurrency bounded (#19)',
+      () async {
+    final client = FakeNodeClient();
+    final discovery = LanDiscovery(
+      client: client,
+      localAddresses: () async => [InternetAddress('10.0.0.112')],
+      sweepTimeout: const Duration(milliseconds: 50),
+    );
+    addTearDown(discovery.stop);
+    await discovery.start(
+      () => nodeInfo('self', host: '10.0.0.112'),
+      const NodeSettings(
+          nodeId: 'self', name: 'self', dataDir: '/tmp/d', apiPort: 47101),
+    );
+    expect(client.infoCalls, greaterThan(0));
+
+    client.infoGate = Completer<void>();
+    final first = discovery.scan();
+    final second = discovery.scan();
+    expect(identical(first, second), isTrue);
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    client.infoGate!.complete();
+    await Future.wait([first, second]);
+    expect(client.maxConcurrentInfoCalls, lessThanOrEqualTo(64));
+  });
+
+  test(
+      'manual peers are remembered and retried after a failed first fetch (#20)',
+      () async {
+    final client = FakeNodeClient();
+    final discovery = LanDiscovery(client: client, sweepEnabled: false);
+    addTearDown(discovery.stop);
+    await discovery.start(
+      () => nodeInfo('self'),
+      const NodeSettings(
+        nodeId: 'self',
+        name: 'self',
+        dataDir: '/tmp/d',
+        apiPort: 47101,
+        manualPeers: ['127.0.0.1:47101'],
+      ),
+    );
+    expect(discovery.peers, isEmpty);
+
+    client.infoByPort[47101] = nodeInfo('manual', apiPort: 47101);
+    await discovery.scan();
+    expect(discovery.peers.map((p) => p.nodeId), contains('manual'));
+  });
+
+  test('peersChanged fires on metadata-only changes (#21)', () async {
+    final client = FakeNodeClient()
+      ..infoByPort[47101] = nodeInfo('peer', apiPort: 47101);
+    final discovery = LanDiscovery(client: client, sweepEnabled: false);
+    addTearDown(discovery.stop);
+    await discovery.start(
+      () => nodeInfo('self'),
+      const NodeSettings(
+        nodeId: 'self',
+        name: 'self',
+        dataDir: '/tmp/d',
+        apiPort: 47101,
+        manualPeers: ['127.0.0.1:47101'],
+      ),
+    );
+    final events = <List<NodeInfo>>[];
+    final sub = discovery.peersChanged.listen(events.add);
+
+    client.infoByPort[47101] = nodeInfo(
+      'peer',
+      name: 'renamed',
+      apiPort: 47101,
+      models: [localModel('qwen3:0.6b')],
+    );
+    await discovery.addManualPeer('127.0.0.1:47101');
+    await Future<void>.delayed(Duration.zero);
+
+    expect(events, isNotEmpty);
+    expect(events.last.single.name, 'renamed');
+    expect(events.last.single.models.single.ref, ModelRef.parse('qwen3:0.6b'));
+    await sub.cancel();
+  });
+
+  test('broadcast addresses use the interface netmask (#24)', () {
+    expect(broadcastAddressFor('10.0.0.112', 24), '10.0.0.255');
+    expect(broadcastAddressFor('172.20.5.7', 16), '172.20.255.255');
+    expect(broadcastAddressFor('192.168.2.10', 23), '192.168.3.255');
+  });
+
+  test('discovery targets the netmask-derived broadcast (#24)', () async {
+    final discovery = LanDiscovery(
+      client: FakeNodeClient(),
+      sweepEnabled: false,
+      localAddresses: () async => [InternetAddress('172.20.5.7')],
+      netmaskResolver: () async => {'172.20.5.7': 16},
+    );
+    addTearDown(discovery.stop);
+    await discovery.start(
+      () => nodeInfo('self', host: '172.20.5.7'),
+      const NodeSettings(
+          nodeId: 'self', name: 'self', dataDir: '/tmp/d', apiPort: 47101),
+    );
+    expect(discovery.debugBroadcastTargets(), contains('172.20.255.255'));
+    expect(discovery.debugBroadcastTargets(), contains('255.255.255.255'));
+  });
+
   test('stale peers become unreachable and are dropped; manual peers are kept',
       () async {
     final clock = FakeClock(DateTime(2025, 1, 1));

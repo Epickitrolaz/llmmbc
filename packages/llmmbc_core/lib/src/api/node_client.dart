@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:http/http.dart' as http;
+import 'package:http/io_client.dart' as io_client;
 
 import '../constants.dart';
 import '../interfaces.dart';
@@ -17,7 +18,8 @@ class HttpNodeClient implements NodeClient {
 
   HttpNodeClient(
       {this.timeout = const Duration(seconds: 5), http.Client? client})
-      : _http = client ?? http.Client();
+      : _http = client ??
+            io_client.IOClient(HttpClient()..connectionTimeout = timeout);
 
   static const Map<String, String> _jsonHeaders = {
     'Content-Type': 'application/json'
