@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:llmmbc_core/llmmbc_core.dart';
@@ -13,6 +14,7 @@ class Harness {
   final FakeNodeClient client;
   final FakeDiscovery discovery;
   final FakeHardwareProbe probe;
+  final ModelStore store;
   final Directory dir;
 
   Harness({
@@ -22,6 +24,7 @@ class Harness {
     required this.client,
     required this.discovery,
     required this.probe,
+    required this.store,
     required this.dir,
   });
 }
@@ -35,10 +38,12 @@ Harness buildHarness({
   bool engineAvailable = true,
   bool workerEnabled = true,
   Duration idle = kSessionIdleTimeout,
+  Duration modelRefreshInterval = const Duration(seconds: 10),
   FakeEngine? engine,
   FakePlanner? planner,
   FakeNodeClient? client,
   FakeDiscovery? discoveryFake,
+  ModelStore? modelStore,
   DateTime Function()? now,
 }) {
   final dir = Directory.systemTemp.createTempSync('llmmbc_node_test');
@@ -61,10 +66,11 @@ Harness buildHarness({
   final fakeClient = client ?? FakeNodeClient();
   final fakeDiscovery = discoveryFake ?? FakeDiscovery(peers.toList());
   final fakeProbe = FakeHardwareProbe(hardware ?? hw());
+  final store = modelStore ?? FakeModelStore(models.toList());
   final service = LocalNodeService.internal(
     settings: settings,
     hardwareProbe: fakeProbe,
-    modelStore: FakeModelStore(models.toList()),
+    modelStore: store,
     discovery: fakeDiscovery,
     client: fakeClient,
     locator: FakeEngineLocator(isAvailable: engineAvailable),
@@ -73,6 +79,7 @@ Harness buildHarness({
     settingsPath: '${dir.path}/settings.json',
     now: now,
     sessionIdleTimeout: idle,
+    modelRefreshInterval: modelRefreshInterval,
   );
   addTearDown(service.stop);
   return Harness(
@@ -82,12 +89,24 @@ Harness buildHarness({
     client: fakeClient,
     discovery: fakeDiscovery,
     probe: fakeProbe,
+    store: store,
     dir: dir,
   );
 }
 
 Matcher llmmbcError(String code) =>
     isA<LlmmbcException>().having((e) => e.code, 'code', code);
+
+Future<void> waitUntil(bool Function() predicate,
+    {Duration timeout = const Duration(seconds: 3)}) async {
+  final deadline = DateTime.now().add(timeout);
+  while (!predicate()) {
+    if (DateTime.now().isAfter(deadline)) {
+      fail('condition not met within $timeout');
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+  }
+}
 
 void main() {
   group('startup', () {
@@ -173,6 +192,86 @@ void main() {
       final h = buildHarness();
       await h.service.start();
       expect(h.service.clusterModels(), isEmpty);
+    });
+  });
+
+  group('runtime model catalog (#33)', () {
+    test('model added to the injected store is visible without restart',
+        () async {
+      final store = FakeModelStore();
+      final h = buildHarness(modelStore: store);
+      await h.service.start();
+      expect(h.service.self.models, isEmpty);
+      expect(h.service.clusterModels(), isEmpty);
+
+      store.stored = [localModel('qwen3:0.6b')];
+      await h.service.refreshModels(force: true);
+      expect(h.service.self.models.single.ref, ModelRef.parse('qwen3:0.6b'));
+      expect(h.service.clusterModels().single.candidates.map((c) => c.nodeId),
+          ['self']);
+
+      // No explicit refresh: chat() must refresh before its candidate check.
+      store.stored = [...store.stored, localModel('a:1b')];
+      final deltas = await h.service.chat(
+          ModelRef.parse('a:1b'), [const ChatMessage('user', 'hi')]).toList();
+      expect(deltas.map((d) => d.content).join(), 'Hello world');
+      expect(h.service.self.models.map((m) => m.ref),
+          contains(ModelRef.parse('a:1b')));
+    });
+
+    test('periodic rescan picks up a store mutation from another process',
+        () async {
+      final store = FakeModelStore();
+      final h = buildHarness(
+        modelStore: store,
+        modelRefreshInterval: const Duration(milliseconds: 100),
+      );
+      await h.service.start();
+      store.stored = [localModel('qwen3:0.6b')];
+
+      await waitUntil(() => h.service.self.models.isNotEmpty);
+      expect(h.service.self.models.single.ref, ModelRef.parse('qwen3:0.6b'));
+      expect(
+          h.service.clusterModels().single.ref, ModelRef.parse('qwen3:0.6b'));
+    });
+
+    test('a CLI-style pull into the node data dir is advertised (#33)',
+        () async {
+      final dataDir = Directory.systemTemp.createTempSync('llmmbc_pull_test');
+      addTearDown(() => dataDir.deleteSync(recursive: true));
+      final store = FileModelStore(dataDir.path);
+      final h = buildHarness(
+        modelStore: store,
+        modelRefreshInterval: const Duration(milliseconds: 100),
+      );
+      await h.service.start();
+      expect(h.service.self.models, isEmpty);
+
+      // Simulate `llmmbc_node pull qwen3:0.6b --data-dir <same dir>`.
+      final hex = 'a' * 64;
+      final blob = File('${dataDir.path}/models/blobs/sha256-$hex')
+        ..createSync(recursive: true)
+        ..writeAsBytesSync(const [1, 2, 3, 4]);
+      expect(blob.existsSync(), isTrue);
+      File('${dataDir.path}/models/manifests/library/qwen3/0.6b.json')
+        ..createSync(recursive: true)
+        ..writeAsStringSync(jsonEncode({
+          'layers': [
+            {'mediaType': kMediaTypeModel, 'digest': 'sha256:$hex', 'size': 4}
+          ]
+        }));
+
+      await waitUntil(() => h.service.self.models
+          .any((m) => m.ref == ModelRef.parse('qwen3:0.6b')));
+
+      final client = HttpNodeClient();
+      try {
+        final info = await client.info(Uri(
+            scheme: 'http', host: '127.0.0.1', port: h.service.self.apiPort));
+        expect(info.models.single.ref, ModelRef.parse('qwen3:0.6b'));
+      } finally {
+        client.close();
+      }
     });
   });
 

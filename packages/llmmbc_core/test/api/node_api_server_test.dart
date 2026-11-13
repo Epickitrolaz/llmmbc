@@ -20,7 +20,7 @@ void main() {
           nodeId: 'self', name: 'self', dataDir: dir.path, apiPort: 0),
       hardwareProbe: FakeHardwareProbe(hw()),
       modelStore: FakeModelStore([localModel('qwen3:0.6b')]),
-      discovery: FakeDiscovery(),
+      discovery: FakeDiscovery([nodeInfo('remote', apiPort: 50001)]),
       client: FakeNodeClient(),
       locator: FakeEngineLocator(),
       engine: FakeEngine(),
@@ -37,7 +37,21 @@ void main() {
     expect(info.hardware.cpuCores, 8);
 
     final peers = await client.peers(base);
-    expect(peers.map((p) => p.nodeId), contains('self'));
+    expect(peers.map((p) => p.nodeId), containsAll(['self', 'remote']));
+    expect(peers.singleWhere((p) => p.nodeId == 'self').isSelf, isTrue);
+    expect(peers.singleWhere((p) => p.nodeId == 'remote').isSelf, isFalse);
+
+    final raw = await http.get(base.resolve('/v1/peers'));
+    final rawPeers =
+        (jsonDecode(raw.body) as Map<String, dynamic>)['peers'] as List;
+    final rawSelf = rawPeers
+        .cast<Map<String, dynamic>>()
+        .singleWhere((p) => p['nodeId'] == 'self');
+    final rawRemote = rawPeers
+        .cast<Map<String, dynamic>>()
+        .singleWhere((p) => p['nodeId'] == 'remote');
+    expect(rawSelf['isSelf'], isTrue);
+    expect(rawRemote['isSelf'], isNot(true));
 
     final models = await service.models.list();
     expect(models.single.ref, ModelRef.parse('qwen3:0.6b'));

@@ -92,6 +92,11 @@ class LocalNodeService implements NodeService {
   Future<void> _sessionQueue = Future.value();
   DateTime? _lastDirectoryRefresh;
   final Duration _directoryRefreshInterval;
+  final Duration _modelRefreshInterval;
+  DateTime? _lastModelRefresh;
+  Future<void>? _modelRefreshFuture;
+  Timer? _modelRefreshTimer;
+  late final ModelStore _exposedModels;
 
   final StreamController<String> _phases = StreamController<String>.broadcast();
   final StreamController<void> _changed = StreamController<void>.broadcast();
@@ -111,6 +116,7 @@ class LocalNodeService implements NodeService {
     DateTime Function()? now,
     Duration sessionIdleTimeout = kSessionIdleTimeout,
     Duration directoryRefreshInterval = const Duration(seconds: 3),
+    Duration modelRefreshInterval = const Duration(seconds: 10),
     http.Client? httpClient,
   })  : _settings = platform.clientOnly
             ? settings.copyWith(workerEnabled: false)
@@ -127,9 +133,14 @@ class LocalNodeService implements NodeService {
         _now = now ?? DateTime.now,
         _idleTimeout = sessionIdleTimeout,
         _directoryRefreshInterval = directoryRefreshInterval,
+        _modelRefreshInterval = modelRefreshInterval,
         _http = httpClient ?? http.Client(),
         _hardware = _fallbackHardware(),
-        _apiPort = settings.apiPort;
+        _apiPort = settings.apiPort {
+    // Pulls/deletes made through `service.models` refresh the catalog when they
+    // complete; direct store mutations are caught by the periodic/on-demand scan.
+    _exposedModels = _TrackingModelStore(_modelStore, _onModelStoreMutated);
+  }
 
   /// Loads/creates settings at [settingsPath] (JSON of NodeSettings), defaulting dataDir to
   /// [defaultDataDir]. Wires LocalHardwareProbe, FileModelStore, LanDiscovery, HttpNodeClient,
@@ -258,25 +269,78 @@ class LocalNodeService implements NodeService {
   HardwareProfile get hardware => _hardware;
 
   @override
-  NodeInfo get self => NodeInfo(
-        nodeId: _settings.nodeId,
-        name: _settings.name,
-        host: _host,
-        apiPort: _apiPort,
-        protocolVersion: kProtocolVersion,
-        appVersion: _kAppVersion,
-        workerEnabled: _workerEnabled,
-        engineAvailable: _engineAvailable,
-        status: _status,
-        hardware: _hardware,
-        models: List<LocalModel>.unmodifiable(_localModels),
-        reachable: true,
-        isSelf: true,
-        lastSeen: _now(),
-      );
+  NodeInfo get self {
+    if (_running) unawaited(refreshModels());
+    return NodeInfo(
+      nodeId: _settings.nodeId,
+      name: _settings.name,
+      host: _host,
+      apiPort: _apiPort,
+      protocolVersion: kProtocolVersion,
+      appVersion: _kAppVersion,
+      workerEnabled: _workerEnabled,
+      engineAvailable: _engineAvailable,
+      status: _status,
+      hardware: _hardware,
+      models: List<LocalModel>.unmodifiable(_localModels),
+      reachable: true,
+      isSelf: true,
+      lastSeen: _now(),
+    );
+  }
+
+  /// Re-lists the local model store and republishes the catalog when it changed.
+  ///
+  /// [force] bypasses the periodic rate limit; concurrent calls share one
+  /// in-flight listing. Not part of `NodeService`, but the app/CLI and the API
+  /// routes use it to make a freshly pulled model visible immediately (#33).
+  Future<void> refreshModels({bool force = false}) {
+    final pending = _modelRefreshFuture;
+    if (pending != null) return pending;
+    final now = _now();
+    final last = _lastModelRefresh;
+    if (!force &&
+        last != null &&
+        now.difference(last) < _modelRefreshInterval) {
+      return Future<void>.value();
+    }
+    _lastModelRefresh = now;
+    late final Future<void> tracked;
+    tracked = _loadModels().whenComplete(() {
+      if (identical(_modelRefreshFuture, tracked)) {
+        _modelRefreshFuture = null;
+      }
+    });
+    _modelRefreshFuture = tracked;
+    return tracked;
+  }
+
+  Future<void> _loadModels() async {
+    List<LocalModel> models;
+    try {
+      models = await _modelStore.list();
+    } on Object {
+      return;
+    }
+    models = [...models]
+      ..sort((a, b) => a.ref.toString().compareTo(b.ref.toString()));
+    final changed = _modelsKey(models) != _modelsKey(_localModels);
+    _localModels = List<LocalModel>.unmodifiable(models);
+    if (changed) _emitChanged();
+  }
+
+  static String _modelsKey(List<LocalModel> models) => [
+        for (final model in models)
+          '${model.ref}|${model.sizeBytes}|${model.ggufPath}|'
+              '${jsonEncode(model.metadata?.toJson())}'
+      ].join(';');
+
+  void _onModelStoreMutated() {
+    unawaited(refreshModels(force: true));
+  }
 
   @override
-  ModelStore get models => _modelStore;
+  ModelStore get models => _exposedModels;
 
   @override
   Discovery get discovery => _discovery;
@@ -324,11 +388,10 @@ class LocalNodeService implements NodeService {
     _emitChanged();
 
     _emitPhase('models');
-    try {
-      _localModels = await _modelStore.list();
-    } on Object {
-      _localModels = const [];
-    }
+    await refreshModels(force: true);
+    _modelRefreshTimer?.cancel();
+    _modelRefreshTimer = Timer.periodic(
+        _modelRefreshInterval, (_) => unawaited(refreshModels()));
     _emitChanged();
 
     _emitPhase('api');
@@ -367,6 +430,8 @@ class LocalNodeService implements NodeService {
   @override
   Future<void> stop() async {
     _running = false;
+    _modelRefreshTimer?.cancel();
+    _modelRefreshTimer = null;
     await _discoverySub?.cancel();
     _discoverySub = null;
     try {
@@ -385,6 +450,7 @@ class LocalNodeService implements NodeService {
 
   @override
   List<ClusterModel> clusterModels() {
+    if (_running) unawaited(refreshModels());
     final accumulator = <ModelRef, _ClusterAccumulator>{};
     final nodes = <NodeInfo>[self, ..._discovery.peers];
     for (final node in nodes) {
@@ -420,6 +486,7 @@ class LocalNodeService implements NodeService {
     double? temperature,
     int? maxTokens,
   }) async* {
+    await refreshModels(force: true);
     final candidates = _candidatesFor(model);
     if (candidates.isEmpty) {
       throw LlmmbcException('no_candidates', 'no node can run $model');
@@ -487,6 +554,7 @@ class LocalNodeService implements NodeService {
     double? temperature,
     int? maxTokens,
   }) async* {
+    await refreshModels(force: true);
     final session = await _serialize(() => _ensureCoordinatorSession(model));
     _touchSession();
 
@@ -543,6 +611,7 @@ class LocalNodeService implements NodeService {
     required String coordinatorId,
     String? hostHint,
   }) async {
+    await refreshModels(force: true);
     if (!_workerEnabled) {
       throw LlmmbcException(
           'not_candidate', 'worker mode is disabled on this node',
@@ -829,7 +898,8 @@ class LocalNodeService implements NodeService {
     try {
       final found = await _modelStore.find(ref);
       if (found != null) {
-        _localModels = [..._localModels, found];
+        _localModels = List<LocalModel>.unmodifiable([..._localModels, found]);
+        _emitChanged();
       }
       return found;
     } on Object {
@@ -894,4 +964,52 @@ class LocalNodeService implements NodeService {
   void _emitChanged() {
     if (!_changed.isClosed) _changed.add(null);
   }
+}
+
+/// Delegates to the real [ModelStore] and announces catalog mutations made
+/// through `NodeService.models` (pull completion, cancel, delete).
+class _TrackingModelStore implements ModelStore {
+  final ModelStore _delegate;
+  final void Function() _onMutated;
+
+  _TrackingModelStore(this._delegate, this._onMutated);
+
+  @override
+  String get modelsDir => _delegate.modelsDir;
+
+  @override
+  Future<List<LocalModel>> list() => _delegate.list();
+
+  @override
+  Future<LocalModel?> find(ModelRef ref) => _delegate.find(ref);
+
+  @override
+  Stream<DownloadProgress> pull(ModelRef ref) async* {
+    await for (final progress in _delegate.pull(ref)) {
+      yield progress;
+      if (progress.state == DownloadState.done ||
+          progress.state == DownloadState.failed ||
+          progress.state == DownloadState.cancelled) {
+        _onMutated();
+      }
+    }
+  }
+
+  @override
+  Future<void> cancel(ModelRef ref) async {
+    await _delegate.cancel(ref);
+    _onMutated();
+  }
+
+  @override
+  Future<void> delete(ModelRef ref) async {
+    await _delegate.delete(ref);
+    _onMutated();
+  }
+
+  @override
+  List<CatalogEntry> catalog() => _delegate.catalog();
+
+  @override
+  Future<int> remoteSize(ModelRef ref) => _delegate.remoteSize(ref);
 }

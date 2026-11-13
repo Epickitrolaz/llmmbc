@@ -55,16 +55,21 @@ class NodeApiServer {
       }
       final path = request.uri.path;
       if (request.method == 'GET' && path == '/v1/node') {
+        await _refreshModels();
         await _json(response, _service.self.toJson());
       } else if (request.method == 'GET' && path == '/v1/peers') {
-        final list = <NodeInfo>[
-          _service.self.copyWith(isSelf: true),
-          ..._service.discovery.peers
-        ];
+        await _refreshModels();
+        final self = _service.self;
+        final peers = _service.discovery.peers;
         await _json(response, {
-          'peers': [for (final p in list) p.toJson()]
+          'peers': [
+            {...self.toJson(), 'isSelf': true},
+            for (final peer in peers)
+              {...peer.toJson(), if (peer.isSelf) 'isSelf': true}
+          ]
         });
       } else if (request.method == 'GET' && path == '/v1/models') {
+        await _refreshModels();
         final models = await _service.models.list();
         await _json(response, {
           'models': [for (final m in models) m.toJson()]
@@ -93,6 +98,17 @@ class NodeApiServer {
     final s = _service;
     if (s is LocalNodeService) return s;
     throw LlmmbcException('internal', 'API server requires a LocalNodeService');
+  }
+
+  Future<void> _refreshModels() async {
+    final s = _service;
+    if (s is LocalNodeService) {
+      try {
+        await s.refreshModels(force: true);
+      } on Object {
+        // Model listing failures must not break the node description.
+      }
+    }
   }
 
   Future<Map<String, dynamic>> _readJson(HttpRequest request) async {

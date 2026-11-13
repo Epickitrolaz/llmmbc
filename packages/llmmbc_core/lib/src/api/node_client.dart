@@ -77,7 +77,16 @@ class HttpNodeClient implements NodeClient {
     if (res.statusCode != 200) throw _error(res.statusCode, res.body);
     final decoded = jsonDecode(res.body) as Map<String, dynamic>;
     final list = decoded['peers'] as List? ?? const [];
-    return [for (final p in list) NodeInfo.fromJson(p as Map<String, dynamic>)];
+    return [
+      for (final entry in list) _peerFromJson(entry as Map<String, dynamic>)
+    ];
+  }
+
+  /// `NodeInfo.toJson` omits observer-side fields; `/v1/peers` adds an explicit
+  /// `isSelf` marker for the queried node, which is read back here (#34).
+  static NodeInfo _peerFromJson(Map<String, dynamic> json) {
+    final info = NodeInfo.fromJson(json);
+    return json['isSelf'] == true ? info.copyWith(isSelf: true) : info;
   }
 
   @override
