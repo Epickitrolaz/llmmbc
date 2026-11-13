@@ -77,7 +77,7 @@ All JSON bodies use the `toJson()` shapes in `lib/src/models.dart`. Errors: `{"e
 | Method & path | Body | Response |
 |---|---|---|
 | `GET /v1/node` | – | `NodeInfo` |
-| `GET /v1/peers` | – | `{"peers": [NodeInfo...]}` (this node's directory) |
+| `GET /v1/peers` | – | `{"peers": [NodeInfo...]}` (this node's directory **plus the node itself**, marked `isSelf: true`) |
 | `GET /v1/models` | – | `{"models": [LocalModel...]}` |
 | `POST /v1/rpc/start` | `{"sessionId": str, "model": str, "coordinatorId": str}` | `{"host": str, "port": int, "budgetBytes": int}` (409 `busy`, 403 `not_candidate`) |
 | `POST /v1/rpc/stop` | `{"sessionId": str}` | `{"ok": true}` |
