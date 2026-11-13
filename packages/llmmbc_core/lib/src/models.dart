@@ -52,11 +52,15 @@ class HardwareProfile {
     this.tags = const [],
   });
 
-  /// Memory this node offers to a session: available RAM minus a safety reserve
-  /// (max(512 MiB, 15% of total)), plus dedicated VRAM. Never negative.
+  /// Memory this node offers to a session: available RAM minus a safety reserve, plus
+  /// dedicated VRAM. Never negative. `availableRamBytes` (MemAvailable) already excludes
+  /// memory in use, so the reserve is a small slice of *available* memory:
+  /// 10% of available, clamped to [256 MiB, 1 GiB] (#47). `NodeSettings.memoryShare`
+  /// is applied on top by the node.
   int get usableMemoryBytes {
-    final reserve = totalRamBytes * 15 ~/ 100;
-    final r = reserve < 512 * 1024 * 1024 ? 512 * 1024 * 1024 : reserve;
+    const minReserve = 256 * 1024 * 1024;
+    const maxReserve = 1024 * 1024 * 1024;
+    final r = (availableRamBytes ~/ 10).clamp(minReserve, maxReserve);
     final ram = availableRamBytes - r;
     final vram = gpus.fold<int>(0, (a, g) => a + g.vramBytes);
     final total = (ram < 0 ? 0 : ram) + vram;

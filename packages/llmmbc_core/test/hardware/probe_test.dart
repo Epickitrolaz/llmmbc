@@ -353,7 +353,8 @@ void main() {
     expect(profile.availableRamBytes, 512 << 20);
     expect(profile.gpus, isEmpty);
     expect(profile.tags, isEmpty);
-    expect(profile.usableMemoryBytes, 0);
+    // 512 MiB available minus the 256 MiB minimum reserve (#47).
+    expect(profile.usableMemoryBytes, 256 << 20);
   });
 
   test('garbage /proc files degrade to conservative values', () async {
