@@ -266,6 +266,18 @@ jobs:
         if: steps.engine.outcome != 'success'
         shell: bash
         run: echo "::notice::engine-${{ matrix.target }} was not produced; skipping the ${{ matrix.target }} CLI bundle"
+      # actions/upload-artifact does not preserve file modes, so restore the
+      # executable bit before bundling the engine with the CLI.
+      - name: Make engine binaries executable
+        if: steps.engine.outcome == 'success' && runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for bin in llama-server rpc-server; do
+            if [ -f "engine-dist/${bin}" ]; then
+              chmod 0755 "engine-dist/${bin}"
+            fi
+          done
       - uses: dart-lang/setup-dart@v1
         if: steps.engine.outcome == 'success'
         with:
@@ -295,6 +307,12 @@ jobs:
           cp dist/llmmbc_node "pkg/${name}/llmmbc_node"
           chmod 0755 "pkg/${name}/llmmbc_node"
           cp -a engine-dist/. "pkg/${name}/engine/"
+          for bin in llama-server rpc-server; do
+            if [ ! -x "pkg/${name}/engine/${bin}" ]; then
+              echo "::error::Missing executable engine/${bin} in ${name}"
+              exit 1
+            fi
+          done
           tar -czf "${name}.tar.gz" -C pkg "${name}"
       - name: Package (windows)
         if: steps.engine.outcome == 'success' && runner.os == 'Windows'
@@ -306,6 +324,9 @@ jobs:
           New-Item -ItemType Directory -Force -Path "pkg/$name/engine" | Out-Null
           Copy-Item "dist/llmmbc_node.exe" "pkg/$name/llmmbc_node.exe"
           Copy-Item "engine-dist/*" "pkg/$name/engine/" -Recurse
+          foreach ($bin in @("llama-server.exe", "rpc-server.exe")) {
+            if (-not (Test-Path "pkg/$name/engine/$bin")) { throw "Missing engine/$bin in $name" }
+          }
           Compress-Archive -Path "pkg/$name/*" -DestinationPath "$name.zip"
       - uses: actions/upload-artifact@v4
         if: steps.engine.outcome == 'success'
@@ -337,6 +358,16 @@ jobs:
         if: steps.engine.outcome != 'success'
         shell: bash
         run: echo "::notice::engine-macos-arm64 was not produced; skipping the macOS CLI bundle"
+      - name: Make engine binaries executable
+        if: steps.engine.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for bin in llama-server rpc-server; do
+            if [ -f "engine-dist/${bin}" ]; then
+              chmod 0755 "engine-dist/${bin}"
+            fi
+          done
       - uses: dart-lang/setup-dart@v1
         if: steps.engine.outcome == 'success'
         with:
@@ -360,6 +391,12 @@ jobs:
           cp dist/llmmbc_node "pkg/${name}/llmmbc_node"
           chmod 0755 "pkg/${name}/llmmbc_node"
           cp -a engine-dist/. "pkg/${name}/engine/"
+          for bin in llama-server rpc-server; do
+            if [ ! -x "pkg/${name}/engine/${bin}" ]; then
+              echo "::error::Missing executable engine/${bin} in ${name}"
+              exit 1
+            fi
+          done
           tar -czf "${name}.tar.gz" -C pkg "${name}"
       - uses: actions/upload-artifact@v4
         if: steps.engine.outcome == 'success'
@@ -474,6 +511,16 @@ jobs:
         if: steps.engine.outcome != 'success'
         shell: bash
         run: echo "::notice::engine-linux-x64 was not produced; skipping the Linux bundle"
+      - name: Make engine binaries executable
+        if: steps.engine.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for bin in llama-server rpc-server; do
+            if [ -f "engine-dist/${bin}" ]; then
+              chmod 0755 "engine-dist/${bin}"
+            fi
+          done
       - uses: subosito/flutter-action@v2
         if: steps.engine.outcome == 'success'
         with:
@@ -581,6 +628,16 @@ jobs:
         if: steps.engine.outcome != 'success'
         shell: bash
         run: echo "::notice::engine-macos-arm64 was not produced; skipping the macOS bundle"
+      - name: Make engine binaries executable
+        if: steps.engine.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for bin in llama-server rpc-server; do
+            if [ -f "engine-dist/${bin}" ]; then
+              chmod 0755 "engine-dist/${bin}"
+            fi
+          done
       - uses: subosito/flutter-action@v2
         if: steps.engine.outcome == 'success'
         with:
