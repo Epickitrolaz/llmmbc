@@ -7,6 +7,7 @@ import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
 import 'package:http/http.dart' as http;
+import 'package:meta/meta.dart';
 import 'package:path/path.dart' as p;
 
 import '../constants.dart';
@@ -44,11 +45,23 @@ class FileModelStore implements ModelStore {
   final String _registryBase;
   final Duration _requestTimeout;
   final Map<String, _PullJob> _jobs = {};
+  // In-flight blob work keyed by full digest. Blobs are content-addressed, so two pulls of
+  // different refs (or tags) that share a layer must share the download, not write the same
+  // `.partial` concurrently (#69).
+  final Map<String, Future<void>> _blobWork = {};
   final Map<String, _CachedMetadata> _metadataCache = {};
   bool _metadataLoaded = false;
 
   static const Duration _progressInterval = Duration(milliseconds: 100);
   static const String _manifestMediaType = 'application/vnd.docker.distribution.manifest.v2+json';
+
+  /// Test-only observation point: receives the size and wall time of each synchronous step
+  /// a pull performs on the calling isolate (file write enqueue, forwarding the slice to the
+  /// hash isolate, progress bookkeeping). The registry tests use it to prove that no
+  /// multi-MB sha256 or write runs on the caller; see `test/registry/large_pull_test.dart`.
+  @internal
+  @visibleForTesting
+  static void Function(int bytes, Duration elapsed)? debugWorkObserver;
 
   @override
   String get modelsDir => p.join(_dataDir, 'models');
@@ -464,12 +477,145 @@ class FileModelStore implements ModelStore {
   /// [baseBytes] is how much of [totalBytes] earlier layers already contributed, so progress
   /// is reported across all layers.
   ///
-  /// Nothing here re-reads a downloaded byte: fresh bytes are hashed incrementally as they
-  /// stream in. On resume, the existing `.partial` prefix is hashed in a background isolate
-  /// (`Isolate.run`, chunked reads) that keeps its hash state and then consumes the resumed
-  /// bytes from the parent isolate, so the digest is available immediately after the last
+  /// Nothing here re-reads a downloaded byte, and no sha256 runs on the calling isolate:
+  /// every chunk is streamed into a background hasher isolate (`Isolate.run`), whether the
+  /// download is fresh or resumed. On resume that isolate first hashes the existing
+  /// `.partial` prefix from disk (chunked reads, `verifying` progress) and then keeps its
+  /// hash state for the resumed bytes, so the digest is available immediately after the last
   /// byte without a second pass over the file.
+  ///
+  /// The body is pulled one slice at a time with awaited file writes, and pulling waits
+  /// while the hash isolate's mailbox is behind, which bounds pull memory on fast links.
   Future<void> _downloadLayer({
+    required _PullJob job,
+    required ModelRef ref,
+    required _Layer layer,
+    required int baseBytes,
+    required int totalBytes,
+  }) async {
+    final key = layer.digest!.toLowerCase();
+    final target = File(_blobPath(layer.digest!));
+    final partial = File('${_blobPath(layer.digest!)}.partial');
+    // Different refs can share a content-addressed layer (e.g. `:latest` and `:1b`), so
+    // joining/owning is decided per digest, never per ref (#69).
+    for (var attempt = 0; attempt < 4; attempt++) {
+      final inFlight = _blobWork[key];
+      if (inFlight == null) {
+        final completer = Completer<void>();
+        final work = completer.future;
+        _blobWork[key] = work;
+        // Joiners await [work]; nobody may be listening when the pull is alone, so mark
+        // errors handled (the owner still receives them through its own await below).
+        work.ignore();
+        try {
+          await _downloadLayerOwned(
+            job: job,
+            ref: ref,
+            layer: layer,
+            baseBytes: baseBytes,
+            totalBytes: totalBytes,
+          );
+          if (!completer.isCompleted) completer.complete();
+        } catch (error, stackTrace) {
+          if (!completer.isCompleted) completer.completeError(error, stackTrace);
+          rethrow;
+        } finally {
+          if (identical(_blobWork[key], work)) _blobWork.remove(key);
+        }
+        return;
+      }
+      final promoted = await _joinBlobWork(
+        job: job,
+        work: inFlight,
+        partial: partial,
+        target: target,
+        baseBytes: baseBytes,
+        totalBytes: totalBytes,
+        expectedSize: layer.size,
+      );
+      if (promoted) {
+        job.transfer.reset(baseBytes + layer.size);
+        _reportDownloading(job, baseBytes + layer.size, totalBytes);
+        return;
+      }
+      if (job.cancelled) throw const _Cancelled();
+      // That owner failed (cancelled, network, timeout): try again, which joins whoever owns
+      // the digest now or becomes the owner ourselves.
+    }
+    throw _PullFailure('blob ${layer.digest}: concurrent downloads kept failing');
+  }
+
+  /// Makes [partial] the final content-addressed blob at [target].
+  ///
+  /// Promotion is idempotent: when another pull already promoted these exact bytes (two refs
+  /// can share a digest) the verified target is kept and the duplicate partial is dropped
+  /// instead of deleting a good blob or failing on a missing `.partial` (#69).
+  Future<void> _promotePartial(File partial, File target, int expectedSize) async {
+    Future<bool> targetIsGood() async =>
+        await target.exists() &&
+        (expectedSize <= 0 || await target.length() == expectedSize);
+    if (await targetIsGood()) {
+      if (await partial.exists()) await partial.delete();
+      return;
+    }
+    if (await target.exists()) await target.delete();
+    try {
+      await partial.rename(target.path);
+    } on FileSystemException {
+      // Someone else promoted (or consumed) the partial between our check and the rename.
+      if (await targetIsGood()) {
+        if (await partial.exists()) await partial.delete();
+        return;
+      }
+      rethrow;
+    }
+  }
+
+  /// Waits for another pull's in-flight download of the same digest, mirroring its progress
+  /// into this job and honouring cancellation. Returns true when the blob is complete.
+  Future<bool> _joinBlobWork({
+    required _PullJob job,
+    required Future<void> work,
+    required File partial,
+    required File target,
+    required int baseBytes,
+    required int totalBytes,
+    required int expectedSize,
+  }) async {
+    final cancelled = Completer<void>();
+    void onCancel() {
+      if (!cancelled.isCompleted) cancelled.complete();
+    }
+
+    job.abort = onCancel;
+    // Poll the partial so the waiting pull still shows progress (its own job is not the
+    // owner, so it gets no chunk callbacks).
+    final poller = Timer.periodic(const Duration(milliseconds: 250), (_) {
+      unawaited(() async {
+        try {
+          final length = await partial.length();
+          if (job.cancelled || length <= 0) return;
+          final effective = expectedSize > 0 && length > expectedSize ? expectedSize : length;
+          _reportDownloading(job, baseBytes + effective, totalBytes);
+        } catch (_) {
+          // The owner may have promoted the partial already.
+        }
+      }());
+    });
+    try {
+      await Future.any<void>([work, cancelled.future]);
+    } catch (_) {
+      // The owner failed; the caller retries as the new owner.
+    } finally {
+      poller.cancel();
+      job.abort = null;
+    }
+    if (job.cancelled) throw const _Cancelled();
+    return await target.exists() &&
+        (expectedSize <= 0 || await target.length() == expectedSize);
+  }
+
+  Future<void> _downloadLayerOwned({
     required _PullJob job,
     required ModelRef ref,
     required _Layer layer,
@@ -492,7 +638,6 @@ class FileModelStore implements ModelStore {
         _reportDownloading(job, baseBytes + layerBytes, totalBytes);
 
     _BackgroundHasher? hasher;
-    _StreamingSha256? accumulator;
     try {
       // Resume: verify the bytes already on disk before appending to them. The prefix is
       // hashed off the calling isolate while `verifying` progress is reported.
@@ -520,8 +665,7 @@ class FileModelStore implements ModelStore {
           // The partial is already the whole blob: verify and promote it without a request.
           final actual = await hasher.finish();
           if (layer.digestSha256 == null || actual == layer.digestSha256) {
-            if (await File(targetPath).exists()) await File(targetPath).delete();
-            await partial.rename(targetPath);
+            await _promotePartial(partial, File(targetPath), layer.size);
             job.transfer.reset(baseBytes + layer.size);
             onDownloadProgress(layer.size);
             return;
@@ -555,7 +699,7 @@ class FileModelStore implements ModelStore {
         await hasher?.abort();
         hasher = null;
         await partial.delete();
-        return await _downloadLayer(
+        return await _downloadLayerOwned(
           job: job,
           ref: ref,
           layer: layer,
@@ -571,18 +715,38 @@ class FileModelStore implements ModelStore {
             'blob ${layer.digest} download failed with HTTP ${response.statusCode}');
       }
 
-      final sink = partial.openWrite(mode: append ? FileMode.append : FileMode.write);
+      final file = await partial.open(mode: append ? FileMode.append : FileMode.write);
       if (job.cancelled) {
-        await sink.close();
+        await file.close();
         throw const _Cancelled();
       }
-      if (hasher == null) accumulator = _StreamingSha256();
+      if (hasher == null) {
+        // Fresh download (or the server restarted one): hash on the background worker as
+        // well, so fresh and resumed pulls share one code path and the calling isolate never
+        // runs sha256 over a body chunk.
+        hasher = await _BackgroundHasher.start(
+          path: partial.path,
+          length: 0,
+          onProgress: (_, __) {},
+        );
+        if (job.cancelled) unawaited(hasher.abort());
+        await hasher.ready;
+        if (job.cancelled) throw const _Cancelled();
+      }
+      final hashWorker = hasher;
       // Rate/ETA only count bytes moved by this request, not the resumed prefix.
       job.transfer.reset(baseBytes + (append ? existing : 0));
 
-      final completer = Completer<void>();
-      late StreamSubscription<List<int>> subscription;
+      // The body is pulled slice by slice instead of being pushed by a stream listener:
+      // every write is awaited, so neither the file nor the hash isolate can queue the
+      // download in memory, whatever the link speed (issue #64). A slice is at most
+      // [_kHashChunkBytes], so the calling isolate's synchronous work per step (write
+      // enqueue + forward to the hasher) stays small (issue #63).
+      final iterator = StreamIterator<List<int>>(response.stream);
       Timer? idleTimer;
+      Object? abortError;
+      Completer<void>? flowWaiter;
+      final observer = FileModelStore.debugWorkObserver;
       var received = append ? existing : 0;
 
       void cancelIdleTimer() {
@@ -590,83 +754,95 @@ class FileModelStore implements ModelStore {
         idleTimer = null;
       }
 
+      void stopBody(Object error) {
+        if (abortError != null) return;
+        abortError = error;
+        cancelIdleTimer();
+        final waiter = flowWaiter;
+        if (waiter != null && !waiter.isCompleted) waiter.complete();
+        unawaited(iterator.cancel());
+      }
+
       void resetIdleTimer() {
         cancelIdleTimer();
         idleTimer = Timer(_requestTimeout, () {
-          unawaited(subscription.cancel());
-          if (!completer.isCompleted) {
-            completer.completeError(_PullFailure(
-                'blob $digest download stalled for ${_requestTimeout.inMilliseconds}ms'));
-          }
+          stopBody(_PullFailure(
+              'blob $digest download stalled for ${_requestTimeout.inMilliseconds}ms'));
         });
       }
 
-      job.abort = () {
-        cancelIdleTimer();
-        unawaited(subscription.cancel());
-        if (!completer.isCompleted) completer.completeError(const _Cancelled());
+      job.abort = () => stopBody(const _Cancelled());
+
+      // Back-pressure for the hash isolate's mailbox: stop pulling while it is behind. The
+      // file write is awaited, so the sink never buffers ahead. Waiting for the worker is
+      // not a stalled body, hence the idle timer is suspended meanwhile.
+      hashWorker.onDrained = () {
+        final waiter = flowWaiter;
+        if (waiter != null && !waiter.isCompleted) waiter.complete();
       };
 
-      subscription = response.stream.listen(
-        (chunk) {
-          if (job.cancelled) {
-            cancelIdleTimer();
-            unawaited(subscription.cancel());
-            if (!completer.isCompleted) completer.completeError(const _Cancelled());
-            return;
-          }
-          resetIdleTimer();
-          sink.add(chunk);
-          // Hash every byte exactly once, as it arrives: no full re-read at the end.
-          final worker = hasher;
-          if (worker != null) {
-            worker.add(chunk);
-            if (worker.outstandingBytes >= _BackgroundHasher.highWaterBytes &&
-                !subscription.isPaused) {
-              // sha256 is slower than a LAN mirror: pause the body instead of queueing the
-              // rest of the model in the hash isolate's mailbox. Pausing is not a stall, so
-              // the idle timer is suspended until the worker acks and the body resumes.
-              cancelIdleTimer();
-              subscription.pause();
-            }
-          } else {
-            accumulator?.add(chunk);
-          }
-          received += chunk.length;
-          onDownloadProgress(received);
-        },
-        onDone: () {
-          cancelIdleTimer();
-          if (!completer.isCompleted) completer.complete();
-        },
-        onError: (Object error, StackTrace stackTrace) {
-          cancelIdleTimer();
-          if (!completer.isCompleted) completer.completeError(error, stackTrace);
-        },
-        cancelOnError: true,
-      );
-      if (hasher != null) {
-        hasher.onDrained = () {
-          if (job.cancelled || !subscription.isPaused) return;
-          resetIdleTimer();
-          subscription.resume();
-        };
+      Future<void> waitForHasher() async {
+        if (hashWorker.outstandingBytes <= _BackgroundHasher.lowWaterBytes) return;
+        if (abortError != null) return;
+        cancelIdleTimer();
+        final waiter = flowWaiter = Completer<void>();
+        await waiter.future;
+        flowWaiter = null;
+        if (abortError == null) resetIdleTimer();
       }
-      // The body may never start after the headers arrive.
-      resetIdleTimer();
 
       try {
-        await completer.future;
-        await sink.flush();
+        resetIdleTimer();
+        while (true) {
+          if (abortError != null) break;
+          final bool hasNext;
+          try {
+            hasNext = await iterator.moveNext();
+          } catch (error) {
+            if (abortError != null) break;
+            rethrow;
+          }
+          if (!hasNext) break;
+          if (abortError != null) break;
+          final chunk = iterator.current;
+          resetIdleTimer();
+          for (var offset = 0; offset < chunk.length; offset += _kHashChunkBytes) {
+            if (abortError != null) break;
+            final end = offset + _kHashChunkBytes < chunk.length
+                ? offset + _kHashChunkBytes
+                : chunk.length;
+            final slice = chunk is Uint8List
+                ? Uint8List.sublistView(chunk, offset, end)
+                : chunk.sublist(offset, end);
+            final watch = observer == null ? null : (Stopwatch()..start());
+            final write = file.writeFrom(slice);
+            // Hash every byte exactly once, as it arrives: no full re-read at the end.
+            hashWorker.add(slice);
+            received += slice.length;
+            onDownloadProgress(received);
+            if (watch != null) {
+              watch.stop();
+              observer!(slice.length, watch.elapsed);
+            }
+            await write;
+            if (abortError != null) break;
+            resetIdleTimer();
+            await waitForHasher();
+          }
+        }
       } finally {
         cancelIdleTimer();
         job.abort = null;
+        final waiter = flowWaiter;
+        if (waiter != null && !waiter.isCompleted) waiter.complete();
         try {
-          await sink.close();
+          await file.close();
         } catch (_) {
-          // Sink may already be closed after a cancellation.
+          // The handle may already be closed after a failure.
         }
+        unawaited(iterator.cancel());
       }
+      if (abortError != null) throw abortError!;
 
       final length = await partial.length();
       if (job.cancelled) throw const _Cancelled();
@@ -674,23 +850,15 @@ class FileModelStore implements ModelStore {
         // Keep the partial so a later pull can resume it.
         throw _PullFailure('blob $digest incomplete: $length of ${layer.size} bytes');
       }
-      final String actual;
-      final worker = hasher;
-      if (worker != null) {
-        actual = await worker.finish();
-        hasher = null;
-      } else {
-        actual = accumulator!.finish();
-        accumulator = null;
-      }
+      final actual = await hashWorker.finish();
+      hasher = null;
       if (job.cancelled) throw const _Cancelled();
       if (layer.digestSha256 != null && actual != layer.digestSha256) {
         // Corrupt data must never be promoted to a blob; start over next time.
         await partial.delete();
         throw _PullFailure('blob $digest failed sha256 verification');
       }
-      if (await File(targetPath).exists()) await File(targetPath).delete();
-      await partial.rename(targetPath);
+      await _promotePartial(partial, File(targetPath), layer.size);
       onDownloadProgress(received);
     } finally {
       // Idempotent cleanup: release the background isolate on success, failure or cancel.
@@ -1059,9 +1227,11 @@ class _PullJob {
   void Function()? abort;
 }
 
-/// Chunk size for background file hashing: large enough to keep the isolate busy, small
-/// enough that progress is reported (and cancellation noticed) promptly.
+/// Granularity of a pull's synchronous steps and of the hash isolate's input: one MiB per
+/// awaited file write / isolate message keeps the calling isolate's per-step work small and
+/// lets prefix-hash progress and cancellation be noticed promptly.
 const int _kHashChunkBytes = 1 << 20;
+
 
 /// Collector for the single digest produced by a chunked sha256 conversion.
 class _DigestCollector implements Sink<Digest> {
@@ -1108,11 +1278,10 @@ class _StreamingSha256 {
 class _BackgroundHasher {
   _BackgroundHasher._(this._events);
 
-  /// Handing more than this many unhashed bytes to the worker would let its mailbox grow
-  /// without bound when the download is faster than sha256 (LAN mirrors); the caller pauses
-  /// the HTTP body above this watermark and resumes below [lowWaterBytes].
-  static const int highWaterBytes = 32 << 20;
-  static const int lowWaterBytes = 16 << 20;
+  /// The caller stops pulling the HTTP body while more than this many bytes are unhashed,
+  /// so a fast link cannot queue the rest of the model in the isolate's mailbox. Small
+  /// enough to keep the in-flight buffers (and the process's RSS) flat on a 1 GiB pull.
+  static const int lowWaterBytes = 4 << 20;
 
   final ReceivePort _events;
   final Completer<SendPort> _handshake = Completer<SendPort>();
@@ -1166,6 +1335,11 @@ class _BackgroundHasher {
         if (hasher.outstandingBytes <= lowWaterBytes) hasher.onDrained?.call();
       } else if (kind == 'digest') {
         if (!hasher._digest.isCompleted) hasher._digest.complete(message[1] as String);
+      } else if (kind == 'cancelled') {
+        // The worker acknowledged the cancel. `abort()` must not depend on the isolate
+        // actually exiting: with a VM service attached (every debug build) the exit
+        // completion can be arbitrarily late, which used to wedge cancellations (#68).
+        if (!hasher._digest.isCompleted) hasher._digest.complete('');
       } else if (kind == 'error') {
         final error = StateError('hash worker: ${message[1]}');
         if (!hasher._ready.isCompleted) hasher._ready.completeError(error);
@@ -1200,12 +1374,33 @@ class _BackgroundHasher {
   /// Completes when the prefix has been hashed and the worker accepts chunks.
   Future<void> get ready => _ready.future;
 
-  /// Feeds resumed bytes to the background hasher.
+  /// Feeds streamed bytes to the background hasher.
+  ///
+  /// Input larger than [_kHashChunkBytes] (the HTTP client can coalesce multi-MiB reads on
+  /// fast links) is split, so no single cross-isolate copy or hash step is long.
   void add(List<int> chunk) {
     final commands = _commands;
     if (commands == null) throw StateError('hash worker is not running');
     _sent += chunk.length;
-    commands.send(chunk is Uint8List ? chunk : Uint8List.fromList(chunk));
+    if (chunk.length <= _kHashChunkBytes) {
+      _send(commands, chunk);
+      return;
+    }
+    for (var offset = 0; offset < chunk.length; offset += _kHashChunkBytes) {
+      final end = offset + _kHashChunkBytes < chunk.length
+          ? offset + _kHashChunkBytes
+          : chunk.length;
+      _send(commands,
+          chunk is Uint8List ? Uint8List.sublistView(chunk, offset, end) : chunk.sublist(offset, end));
+    }
+  }
+
+  /// Hands one slice to the worker. [TransferableTypedData] moves ownership of the buffer
+  /// instead of copying it into the receiving isolate's mutable heap, so a multi-GiB pull
+  /// does not leave a gigabyte of message copies for the GC to collect.
+  static void _send(SendPort commands, List<int> slice) {
+    final bytes = slice is Uint8List ? slice : Uint8List.fromList(slice);
+    commands.send(TransferableTypedData.fromList([bytes]));
   }
 
   /// Stops after the prefix, returns the digest of everything hashed so far.
@@ -1227,9 +1422,12 @@ class _BackgroundHasher {
     _finished = true;
     _commands?.send('cancel');
     try {
-      await _digest.future;
+      // The worker answers with an explicit `cancelled` message; the watchdog only covers a
+      // worker that died without acknowledging, so a terminal pull event never waits on
+      // isolate exit (which a VM service can delay indefinitely, see #68).
+      await _digest.future.timeout(const Duration(seconds: 2));
     } catch (_) {
-      // The worker may already have died; nothing left to clean up.
+      // The worker may already have died (or be paused by a debugger): nothing to clean up.
     } finally {
       _events.close();
     }
@@ -1261,29 +1459,33 @@ Future<String> _hashWorkerMain(String path, int length, SendPort parent) async {
   final accumulator = _StreamingSha256();
   var hashed = 0;
   try {
-    final raf = await File(path).open();
-    try {
-      while (hashed < length && !cancelled) {
-        final remaining = length - hashed;
-        final chunk =
-            await raf.read(remaining > _kHashChunkBytes ? _kHashChunkBytes : remaining);
-        if (chunk.isEmpty) break;
-        accumulator.add(chunk);
-        hashed += chunk.length;
-        parent.send(<Object?>['progress', hashed, length]);
+    // A zero-length prefix means a fresh download: there is nothing to read, the worker just
+    // waits for chunks from the caller (and never needs the file to exist yet).
+    if (length > 0) {
+      final raf = await File(path).open();
+      try {
+        while (hashed < length && !cancelled) {
+          final remaining = length - hashed;
+          final chunk =
+              await raf.read(remaining > _kHashChunkBytes ? _kHashChunkBytes : remaining);
+          if (chunk.isEmpty) break;
+          accumulator.add(chunk);
+          hashed += chunk.length;
+          parent.send(<Object?>['progress', hashed, length]);
+        }
+      } finally {
+        await raf.close();
       }
-    } finally {
-      await raf.close();
-    }
-    if (cancelled) {
-      parent.send(<Object?>['cancelled']);
-      return '';
-    }
-    if (hashed != length) {
-      // The partial shrank between `length()` and the read: appending at the real EOF would
-      // produce a blob that can never match the manifest.
-      parent.send(<Object?>['error', 'partial ended at $hashed of $length bytes']);
-      return '';
+      if (cancelled) {
+        parent.send(<Object?>['cancelled']);
+        return '';
+      }
+      if (hashed != length) {
+        // The partial shrank between `length()` and the read: appending at the real EOF would
+        // produce a blob that can never match the manifest.
+        parent.send(<Object?>['error', 'partial ended at $hashed of $length bytes']);
+        return '';
+      }
     }
     parent.send(<Object?>['ready']);
     var acked = 0;
@@ -1293,9 +1495,10 @@ Future<String> _hashWorkerMain(String path, int length, SendPort parent) async {
         cancelled = true;
         break;
       }
-      if (message is Uint8List) {
-        accumulator.add(message);
-        acked += message.length;
+      if (message is TransferableTypedData) {
+        final bytes = message.materialize().asUint8List();
+        accumulator.add(bytes);
+        acked += bytes.length;
         // Credit for the caller's back-pressure: it pauses the body above a watermark.
         parent.send(<Object?>['ack', acked]);
       }
