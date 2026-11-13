@@ -290,9 +290,197 @@ void main() {
         'stream': true,
       }),
     );
-    expect(response.statusCode, 403);
+    expect(response.statusCode, 409);
     expect(response.headers['content-type'], contains('application/json'));
     final json = jsonDecode(response.body) as Map<String, dynamic>;
-    expect((json['error'] as Map)['code'], 'not_candidate');
+    expect((json['error'] as Map)['code'], 'no_candidates');
+  });
+
+  group('chat routing on the API (#38)', () {
+    test(
+        'without the route header a client-only node forwards to the coordinator',
+        () async {
+      final dir = Directory.systemTemp.createTempSync('llmmbc_api_test');
+      addTearDown(() => dir.deleteSync(recursive: true));
+      final client = FakeNodeClient();
+      final service = LocalNodeService.internal(
+        settings: NodeSettings(
+          nodeId: 'client',
+          name: 'client',
+          dataDir: dir.path,
+          apiPort: 0,
+          workerEnabled: false,
+        ),
+        hardwareProbe: FakeHardwareProbe(hw()),
+        modelStore: FakeModelStore(),
+        discovery: FakeDiscovery([
+          nodeInfo(
+            'coord',
+            apiPort: 50002,
+            models: [localModel('qwen3:0.6b')],
+          ),
+        ]),
+        client: client,
+        locator: FakeEngineLocator(),
+        engine: FakeEngine(),
+        planner: FakePlanner(),
+        settingsPath: '${dir.path}/settings.json',
+      );
+      addTearDown(service.stop);
+      await service.start();
+
+      final response = await http.post(
+        baseOf(service).resolve('/v1/chat/completions'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'model': 'qwen3:0.6b',
+          'messages': [
+            {'role': 'user', 'content': 'hi'}
+          ],
+        }),
+      );
+      expect(response.statusCode, 200);
+      final json = jsonDecode(response.body) as Map<String, dynamic>;
+      final choice = (json['choices'] as List).single as Map;
+      expect((choice['message'] as Map)['content'], 'remote answer');
+
+      expect(client.chatBases.single.port, 50002);
+      expect(client.chatRouteFlags, [true]);
+      expect(service.currentSession, isNull);
+      expect(service.self.status, NodeStatus.idle);
+    });
+
+    test(
+        'with the coordinator header a candidate serves locally, never forwards',
+        () async {
+      final dir = Directory.systemTemp.createTempSync('llmmbc_api_test');
+      addTearDown(() => dir.deleteSync(recursive: true));
+      final client = FakeNodeClient();
+      final service = LocalNodeService.internal(
+        settings: NodeSettings(
+            nodeId: 'self', name: 'self', dataDir: dir.path, apiPort: 0),
+        hardwareProbe: FakeHardwareProbe(hw()),
+        modelStore: FakeModelStore([localModel('qwen3:0.6b')]),
+        discovery: FakeDiscovery([
+          nodeInfo(
+            'bigger',
+            apiPort: 50002,
+            models: [localModel('qwen3:0.6b')],
+            hardware: hw(total: 64 << 30, available: 60 << 30),
+          ),
+        ]),
+        client: client,
+        locator: FakeEngineLocator(),
+        engine: FakeEngine(),
+        planner: FakePlanner(),
+        settingsPath: '${dir.path}/settings.json',
+      );
+      addTearDown(service.stop);
+      await service.start();
+
+      final response = await http.post(
+        baseOf(service).resolve('/v1/chat/completions'),
+        headers: {
+          'Content-Type': 'application/json',
+          kHeaderChatRoute: kRouteCoordinator,
+        },
+        body: jsonEncode({
+          'model': 'qwen3:0.6b',
+          'messages': [
+            {'role': 'user', 'content': 'hi'}
+          ],
+        }),
+      );
+      expect(response.statusCode, 200);
+      expect(response.headers['x-llmmbc-node'], 'self');
+      final json = jsonDecode(response.body) as Map<String, dynamic>;
+      final choice = (json['choices'] as List).single as Map;
+      expect((choice['message'] as Map)['content'], 'Hello world');
+      expect(client.chatBases, isEmpty);
+      expect(service.currentSession?.coordinatorId, 'self');
+    });
+
+    test(
+        'with the coordinator header a non-candidate rejects without forwarding',
+        () async {
+      final dir = Directory.systemTemp.createTempSync('llmmbc_api_test');
+      addTearDown(() => dir.deleteSync(recursive: true));
+      final client = FakeNodeClient();
+      final service = LocalNodeService.internal(
+        settings: NodeSettings(
+          nodeId: 'client',
+          name: 'client',
+          dataDir: dir.path,
+          apiPort: 0,
+          workerEnabled: false,
+        ),
+        hardwareProbe: FakeHardwareProbe(hw()),
+        modelStore: FakeModelStore(),
+        discovery: FakeDiscovery([
+          nodeInfo('coord', apiPort: 50002, models: [localModel('qwen3:0.6b')]),
+        ]),
+        client: client,
+        locator: FakeEngineLocator(),
+        engine: FakeEngine(),
+        planner: FakePlanner(),
+        settingsPath: '${dir.path}/settings.json',
+      );
+      addTearDown(service.stop);
+      await service.start();
+
+      final response = await http.post(
+        baseOf(service).resolve('/v1/chat/completions'),
+        headers: {
+          'Content-Type': 'application/json',
+          kHeaderChatRoute: kRouteCoordinator,
+        },
+        body: jsonEncode({
+          'model': 'qwen3:0.6b',
+          'messages': [
+            {'role': 'user', 'content': 'hi'}
+          ],
+        }),
+      );
+      expect(response.statusCode, 403);
+      final json = jsonDecode(response.body) as Map<String, dynamic>;
+      expect((json['error'] as Map)['code'], 'not_candidate');
+      expect(client.chatBases, isEmpty);
+    });
+
+    test('rejects an unknown routing header value', () async {
+      final dir = Directory.systemTemp.createTempSync('llmmbc_api_test');
+      addTearDown(() => dir.deleteSync(recursive: true));
+      final service = LocalNodeService.internal(
+        settings: NodeSettings(
+            nodeId: 'self', name: 'self', dataDir: dir.path, apiPort: 0),
+        hardwareProbe: FakeHardwareProbe(hw()),
+        modelStore: FakeModelStore([localModel('qwen3:0.6b')]),
+        discovery: FakeDiscovery(),
+        client: FakeNodeClient(),
+        locator: FakeEngineLocator(),
+        engine: FakeEngine(),
+        planner: FakePlanner(),
+        settingsPath: '${dir.path}/settings.json',
+      );
+      addTearDown(service.stop);
+      await service.start();
+
+      final response = await http.post(
+        baseOf(service).resolve('/v1/chat/completions'),
+        headers: {
+          'Content-Type': 'application/json',
+          kHeaderChatRoute: 'elsewhere',
+        },
+        body: jsonEncode({
+          'model': 'qwen3:0.6b',
+          'messages': [
+            {'role': 'user', 'content': 'hi'}
+          ],
+        }),
+      );
+      expect(response.statusCode, 400);
+      final json = jsonDecode(response.body) as Map<String, dynamic>;
+      expect((json['error'] as Map)['code'], 'bad_request');
+    });
   });
 }

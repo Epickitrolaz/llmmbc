@@ -658,5 +658,59 @@ void main() {
       expect(h.service.currentSession!.workerIds, isEmpty);
       expect(h.service.currentSession!.coordinatorId, 'self');
     });
+
+    test(
+        'uses the rpc port returned by each worker, keeping endpoints distinct',
+        () async {
+      final client = FakeNodeClient()
+        ..rpcPortByApiPort[50001] = 51001
+        ..rpcPortByApiPort[50002] = 51002;
+      final h = buildHarness(
+        models: [localModel('qwen3:0.6b')],
+        peers: [
+          nodeInfo('w1', apiPort: 50001, models: [localModel('qwen3:0.6b')]),
+          nodeInfo('w2', apiPort: 50002, models: [localModel('qwen3:0.6b')]),
+        ],
+        client: client,
+      );
+      await h.service.start();
+      await h.service.chat(ModelRef.parse('qwen3:0.6b'),
+          [const ChatMessage('user', 'hi')]).toList();
+
+      final endpoints = [
+        for (final node in h.engine.lastPlan!.nodes)
+          if (node.rpcEndpoint != null) node.rpcEndpoint!
+      ];
+      expect(endpoints, ['127.0.0.1:51001', '127.0.0.1:51002']);
+      expect(endpoints.toSet(), hasLength(2));
+      expect(h.service.currentSession!.workerIds, ['w1', 'w2']);
+    });
+
+    test('drops a worker that reports an endpoint already in the plan (#36)',
+        () async {
+      final client = FakeNodeClient()
+        ..rpcPortByApiPort[50001] = 51000
+        ..rpcPortByApiPort[50002] = 51000;
+      final h = buildHarness(
+        models: [localModel('qwen3:0.6b')],
+        peers: [
+          nodeInfo('w1', apiPort: 50001, models: [localModel('qwen3:0.6b')]),
+          nodeInfo('w2', apiPort: 50002, models: [localModel('qwen3:0.6b')]),
+        ],
+        client: client,
+      );
+      await h.service.start();
+      await h.service.chat(ModelRef.parse('qwen3:0.6b'),
+          [const ChatMessage('user', 'hi')]).toList();
+
+      final endpoints = [
+        for (final node in h.engine.lastPlan!.nodes)
+          if (node.rpcEndpoint != null) node.rpcEndpoint!
+      ];
+      expect(endpoints, ['127.0.0.1:51000']);
+      expect(h.service.currentSession!.workerIds, ['w1']);
+      // The dropped worker is told to stop so it does not leak an rpc-server.
+      expect(client.stopRpcCalls.map((c) => c.base.port), contains(50002));
+    });
   });
 }

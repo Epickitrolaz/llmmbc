@@ -7,13 +7,22 @@ import 'dart:convert';
 
 import '../models.dart';
 
+const String _openThink = '<think\u003e';
+const String _closeThink = '</think\u003e';
+
 /// Parses an OpenAI `chat/completions` SSE stream into [ChatDelta]s.
 ///
 /// Handles `data: {...}` events and the terminating `data: [DONE]` sentinel. The
 /// optional [servedBy] is copied onto every emitted delta.
+///
+/// Reasoning models (e.g. qwen3 with `--jinja`) emit `delta.reasoning_content`
+/// instead of `delta.content`. [ChatDelta] only carries `content`, so reasoning
+/// is surfaced inside `<think>…</think>` markers; clients that render `content`
+/// therefore still see a non-empty answer (#39).
 Stream<ChatDelta> parseOpenAiSse(Stream<List<int>> body,
     {String? servedBy}) async* {
   final lines = body.transform(utf8.decoder).transform(const LineSplitter());
+  var inReasoning = false;
   await for (final raw in lines) {
     final line = raw.trim();
     if (line.isEmpty || !line.startsWith('data:')) continue;
@@ -46,11 +55,34 @@ Stream<ChatDelta> parseOpenAiSse(Stream<List<int>> body,
     for (final choice in choices) {
       if (choice is! Map) continue;
       final rawDelta = choice['delta'] ?? choice['message'];
+      final reasoning = rawDelta is Map
+          ? (rawDelta['reasoning_content']?.toString() ?? '')
+          : '';
       final content =
           rawDelta is Map ? (rawDelta['content']?.toString() ?? '') : '';
       final finish = choice['finish_reason'] as String?;
-      if (content.isEmpty && finish == null) continue;
-      yield ChatDelta(content, finishReason: finish, servedBy: servedBy);
+
+      if (reasoning.isNotEmpty) {
+        if (!inReasoning) {
+          inReasoning = true;
+          yield ChatDelta(_openThink, servedBy: servedBy);
+        }
+        yield ChatDelta(reasoning, servedBy: servedBy);
+      }
+      if (content.isNotEmpty) {
+        if (inReasoning) {
+          inReasoning = false;
+          yield ChatDelta(_closeThink, servedBy: servedBy);
+        }
+        yield ChatDelta(content, servedBy: servedBy);
+      }
+      if (finish != null) {
+        if (inReasoning) {
+          inReasoning = false;
+          yield ChatDelta(_closeThink, servedBy: servedBy);
+        }
+        yield ChatDelta('', finishReason: finish, servedBy: servedBy);
+      }
     }
   }
 }

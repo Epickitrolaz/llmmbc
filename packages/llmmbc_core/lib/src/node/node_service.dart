@@ -496,13 +496,27 @@ class LocalNodeService implements NodeService {
       yield* handleChat(model, messages,
           temperature: temperature, maxTokens: maxTokens);
     } else {
-      yield* _client.chat(
-        coordinator.baseUri,
-        model,
-        messages,
-        temperature: temperature,
-        maxTokens: maxTokens,
-      );
+      final client = _client;
+      if (client is ChatRouteClient) {
+        // Forwarded requests must carry the routing header so the coordinator
+        // serves them locally instead of routing again (#38).
+        yield* (client as ChatRouteClient).chat(
+          coordinator.baseUri,
+          model,
+          messages,
+          temperature: temperature,
+          maxTokens: maxTokens,
+          asCoordinator: true,
+        );
+      } else {
+        yield* client.chat(
+          coordinator.baseUri,
+          model,
+          messages,
+          temperature: temperature,
+          maxTokens: maxTokens,
+        );
+      }
     }
   }
 
@@ -686,6 +700,18 @@ class LocalNodeService implements NodeService {
   }
 
   Future<_CoordinatorSession> _ensureCoordinatorSession(ModelRef model) async {
+    // Only a candidate (§2.2) may act as coordinator; a client-only node that
+    // receives the routing header must be rejected, not silently serve (#38).
+    if (!_workerEnabled) {
+      throw LlmmbcException(
+          'not_candidate', 'worker mode is disabled on this node',
+          httpStatus: 403);
+    }
+    if (!_engineAvailable) {
+      throw LlmmbcException(
+          'not_candidate', 'engine binaries are unavailable on this node',
+          httpStatus: 403);
+    }
     final local = await _findLocalModel(model);
     if (local == null) {
       throw LlmmbcException(
@@ -732,6 +758,7 @@ class LocalNodeService implements NodeService {
 
     final sessionId = const Uuid().v4();
     final workerBases = <String, Uri>{};
+    final endpoints = <String>{};
     final planNodes = <PlanNode>[
       PlanNode(
         nodeId: _settings.nodeId,
@@ -751,10 +778,21 @@ class LocalNodeService implements NodeService {
           model: model,
           coordinatorId: _settings.nodeId,
         );
+        final endpoint = '${result.host}:${result.port}';
+        if (!endpoints.add(endpoint)) {
+          // llama.cpp silently collapses duplicate endpoints into one device,
+          // so a plan must never name the same rpc-server twice (#36).
+          try {
+            await _client.stopRpc(candidate.baseUri, sessionId);
+          } on Object {
+            // ignore
+          }
+          continue;
+        }
         workerBases[candidate.nodeId] = candidate.baseUri;
         planNodes.add(PlanNode(
           nodeId: candidate.nodeId,
-          rpcEndpoint: '${result.host}:${result.port}',
+          rpcEndpoint: endpoint,
           budgetBytes: result.budgetBytes,
           hasGpu: candidate.hardware.gpus.isNotEmpty,
         ));
