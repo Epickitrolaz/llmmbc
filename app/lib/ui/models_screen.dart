@@ -10,6 +10,7 @@ import 'package:flutter/material.dart';
 import '../app/app_session.dart';
 import '../util/format.dart';
 import 'widgets/common.dart';
+import 'widgets/download_progress.dart';
 
 class ModelsScreen extends StatefulWidget {
   const ModelsScreen({super.key});
@@ -20,7 +21,7 @@ class ModelsScreen extends StatefulWidget {
 
 class _ModelsScreenState extends State<ModelsScreen> {
   final TextEditingController _pullField = TextEditingController();
-  final Map<String, DownloadProgress> _downloads = {};
+  final Map<String, DownloadThrottle> _downloads = {};
   final Map<String, StreamSubscription<DownloadProgress>> _subscriptions = {};
 
   late AppSession _session;
@@ -45,6 +46,9 @@ class _ModelsScreenState extends State<ModelsScreen> {
   void dispose() {
     for (final subscription in _subscriptions.values) {
       subscription.cancel();
+    }
+    for (final throttle in _downloads.values) {
+      throttle.dispose();
     }
     _pullField.dispose();
     super.dispose();
@@ -79,28 +83,32 @@ class _ModelsScreenState extends State<ModelsScreen> {
 
   bool _isLocal(ModelRef ref) => _local.any((model) => model.ref == ref);
 
-  DownloadProgress? _progressFor(ModelRef ref) => _downloads[ref.toString()];
+  /// One throttle per pulled model; rows listen to it directly so progress
+  /// events rebuild only their own row (and at most ten times per second).
+  DownloadThrottle _throttleFor(ModelRef ref) =>
+      _downloads.putIfAbsent(ref.toString(), () => DownloadThrottle(ref));
 
   /// Downloads started by name that have no catalog row of their own.
-  List<DownloadProgress> get _orphanDownloads {
+  List<DownloadThrottle> get _orphanDownloads {
     final catalogRefs = _catalog.map((entry) => entry.ref.toString()).toSet();
     return [
       for (final entry in _downloads.entries)
-        if (!catalogRefs.contains(entry.key)) entry.value,
+        if (!catalogRefs.contains(entry.key) && entry.value.value != null) entry.value,
     ];
   }
 
   void _startDownload(ModelRef ref) {
     final key = ref.toString();
     _subscriptions.remove(key)?.cancel();
-    setState(() {
-      _pullError = null;
-      _downloads[key] = DownloadProgress(ref, DownloadState.resolving);
-    });
+    final throttle = _throttleFor(ref);
+    throttle.reset(DownloadProgress(ref, DownloadState.resolving));
+    // Rebuild once so a by-name pull appears in the Downloads card; per-event
+    // updates never call setState.
+    setState(() => _pullError = null);
     final subscription = _session.service.models.pull(ref).listen(
       (progress) {
         if (!mounted) return;
-        setState(() => _downloads[key] = progress);
+        throttle.push(progress);
         if (progress.state == DownloadState.done || progress.state == DownloadState.failed) {
           _load(force: true);
         }
@@ -108,15 +116,14 @@ class _ModelsScreenState extends State<ModelsScreen> {
       onError: (Object error) {
         if (!mounted) return;
         final message = error is LlmmbcException ? error.message : error.toString();
-        setState(() {
-          _downloads[key] = DownloadProgress(
-            ref,
-            DownloadState.failed,
-            receivedBytes: _downloads[key]?.receivedBytes ?? 0,
-            totalBytes: _downloads[key]?.totalBytes ?? 0,
-            error: message,
-          );
-        });
+        final current = throttle.value;
+        throttle.push(DownloadProgress(
+          ref,
+          DownloadState.failed,
+          receivedBytes: current?.receivedBytes ?? 0,
+          totalBytes: current?.totalBytes ?? 0,
+          error: message,
+        ));
       },
       onDone: () => _subscriptions.remove(key),
     );
@@ -125,18 +132,15 @@ class _ModelsScreenState extends State<ModelsScreen> {
 
   Future<void> _cancelDownload(ModelRef ref) async {
     await _session.service.models.cancel(ref);
-    final key = ref.toString();
-    final current = _downloads[key];
-    if (mounted && current != null) {
-      setState(() {
-        _downloads[key] = DownloadProgress(
-          ref,
-          DownloadState.cancelled,
-          receivedBytes: current.receivedBytes,
-          totalBytes: current.totalBytes,
-        );
-      });
-    }
+    if (!mounted) return;
+    final throttle = _throttleFor(ref);
+    final current = throttle.value;
+    throttle.push(DownloadProgress(
+      ref,
+      DownloadState.cancelled,
+      receivedBytes: current?.receivedBytes ?? 0,
+      totalBytes: current?.totalBytes ?? 0,
+    ));
   }
 
   Future<void> _pullByName() async {
@@ -250,7 +254,7 @@ class _ModelsScreenState extends State<ModelsScreen> {
                     error: _loadError,
                     downloadsEnabled: _session.downloadsEnabled,
                     isLocal: _isLocal,
-                    progressFor: _progressFor,
+                    throttleFor: _throttleFor,
                     onDownload: _startDownload,
                     onCancel: _cancelDownload,
                   ),
@@ -336,7 +340,7 @@ class _CatalogCard extends StatelessWidget {
     required this.error,
     required this.downloadsEnabled,
     required this.isLocal,
-    required this.progressFor,
+    required this.throttleFor,
     required this.onDownload,
     required this.onCancel,
   });
@@ -346,7 +350,7 @@ class _CatalogCard extends StatelessWidget {
   final String? error;
   final bool downloadsEnabled;
   final bool Function(ModelRef) isLocal;
-  final DownloadProgress? Function(ModelRef) progressFor;
+  final DownloadThrottle Function(ModelRef) throttleFor;
   final void Function(ModelRef) onDownload;
   final Future<void> Function(ModelRef) onCancel;
 
@@ -376,7 +380,7 @@ class _CatalogCard extends StatelessWidget {
             _CatalogRow(
               entry: sorted[i],
               downloaded: isLocal(sorted[i].ref),
-              progress: progressFor(sorted[i].ref),
+              throttle: throttleFor(sorted[i].ref),
               downloadsEnabled: downloadsEnabled,
               onDownload: () => onDownload(sorted[i].ref),
               onCancel: () => onCancel(sorted[i].ref),
@@ -400,7 +404,7 @@ class _CatalogRow extends StatelessWidget {
   const _CatalogRow({
     required this.entry,
     required this.downloaded,
-    required this.progress,
+    required this.throttle,
     required this.downloadsEnabled,
     required this.onDownload,
     required this.onCancel,
@@ -408,13 +412,22 @@ class _CatalogRow extends StatelessWidget {
 
   final CatalogEntry entry;
   final bool downloaded;
-  final DownloadProgress? progress;
+  final DownloadThrottle throttle;
   final bool downloadsEnabled;
   final VoidCallback onDownload;
   final Future<void> Function() onCancel;
 
   @override
   Widget build(BuildContext context) {
+    // Only this row rebuilds while the pull streams; the rest of the screen is
+    // untouched. The throttle caps it at 10 rebuilds per second.
+    return ValueListenableBuilder<DownloadProgress?>(
+      valueListenable: throttle.progress,
+      builder: (context, progress, _) => _buildRow(context, progress),
+    );
+  }
+
+  Widget _buildRow(BuildContext context, DownloadProgress? progress) {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
     final state = progress?.state;
@@ -423,41 +436,16 @@ class _CatalogRow extends StatelessWidget {
         state != DownloadState.failed &&
         state != DownloadState.cancelled;
     final key = entry.ref.toString();
+    final showStatus = progress != null && state != DownloadState.done;
 
-    Widget trailing;
-    if (downloaded) {
+    Widget? trailing;
+    if (downloaded && !active) {
       trailing = const MetaChip(label: 'downloaded', icon: Icons.check_circle_outline, highlighted: true);
-    } else if (active) {
-      trailing = Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          SizedBox(
-            width: 120,
-            child: LinearProgressIndicator(value: progress!.totalBytes > 0 ? progress!.fraction : null),
-          ),
-          const SizedBox(width: 10),
-          Text(
-            progress!.totalBytes > 0 ? formatPercent(progress!.fraction) : '…',
-            style: theme.textTheme.labelSmall,
-          ),
-          IconButton(
-            key: Key('download-cancel-$key'),
-            tooltip: 'Cancel',
-            icon: const Icon(Icons.close, size: 18),
-            onPressed: onCancel,
-          ),
-        ],
-      );
-    } else {
-      final label = state == DownloadState.cancelled
-          ? 'Resume'
-          : state == DownloadState.failed
-              ? 'Retry'
-              : 'Download';
+    } else if (progress == null || state == DownloadState.done) {
       trailing = FilledButton.tonal(
         key: Key('download-btn-$key'),
         onPressed: downloadsEnabled ? onDownload : null,
-        child: Text(label),
+        child: const Text('Download'),
       );
     }
 
@@ -493,18 +481,22 @@ class _CatalogRow extends StatelessWidget {
                     MetaChip(label: formatBytes(entry.approxSizeBytes), icon: Icons.sd_storage_outlined),
                   ],
                 ),
-                if (state == DownloadState.failed && progress?.error != null) ...[
-                  const SizedBox(height: 4),
-                  Text(
-                    progress!.error!,
-                    style: theme.textTheme.bodySmall?.copyWith(color: scheme.error),
+                if (showStatus) ...[
+                  const SizedBox(height: 8),
+                  DownloadStatusTile(
+                    progress: progress,
+                    onCancel: active ? onCancel : null,
+                    onRestart: active ? null : onDownload,
+                    restartLabel: state == DownloadState.cancelled ? 'Resume' : 'Retry',
                   ),
                 ],
               ],
             ),
           ),
-          const SizedBox(width: 12),
-          trailing,
+          if (trailing != null) ...[
+            const SizedBox(width: 12),
+            trailing,
+          ],
         ],
       ),
     );
@@ -671,7 +663,7 @@ class _ActiveDownloadsCard extends StatelessWidget {
     required this.onResume,
   });
 
-  final List<DownloadProgress> downloads;
+  final List<DownloadThrottle> downloads;
   final Future<void> Function(ModelRef) onCancel;
   final void Function(ModelRef) onResume;
 
@@ -685,53 +677,26 @@ class _ActiveDownloadsCard extends StatelessWidget {
       child: Column(
         children: [
           for (var i = 0; i < downloads.length; i++) ...[
-            Builder(
-              builder: (context) {
-                final progress = downloads[i];
+            ValueListenableBuilder<DownloadProgress?>(
+              valueListenable: downloads[i].progress,
+              builder: (context, progress, _) {
+                if (progress == null) return const SizedBox.shrink();
                 final ref = progress.ref;
-                final state = progress.state;
-                final active = state != DownloadState.done &&
-                    state != DownloadState.failed &&
-                    state != DownloadState.cancelled;
-                return Row(
+                final active = progress.state != DownloadState.done &&
+                    progress.state != DownloadState.failed &&
+                    progress.state != DownloadState.cancelled;
+                return Column(
                   key: Key('download-row-$ref'),
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(ref.toString(), style: theme.textTheme.titleSmall),
-                          const SizedBox(height: 4),
-                          if (active)
-                            LinearProgressIndicator(
-                              value: progress.totalBytes > 0 ? progress.fraction : null,
-                            )
-                          else
-                            Text(
-                              state == DownloadState.done
-                                  ? 'Downloaded'
-                                  : state == DownloadState.cancelled
-                                      ? 'Cancelled — partial blobs are kept for resume'
-                                      : progress.error ?? 'Failed',
-                              style: theme.textTheme.bodySmall,
-                            ),
-                        ],
-                      ),
+                    Text(ref.toString(), style: theme.textTheme.titleSmall),
+                    const SizedBox(height: 6),
+                    DownloadStatusTile(
+                      progress: progress,
+                      onCancel: active ? () => onCancel(ref) : null,
+                      onRestart: active ? null : () => onResume(ref),
+                      restartLabel: progress.state == DownloadState.cancelled ? 'Resume' : 'Retry',
                     ),
-                    const SizedBox(width: 12),
-                    if (active)
-                      IconButton(
-                        key: Key('download-cancel-$ref'),
-                        tooltip: 'Cancel',
-                        icon: const Icon(Icons.close),
-                        onPressed: () => onCancel(ref),
-                      )
-                    else if (state != DownloadState.done)
-                      FilledButton.tonal(
-                        key: Key('download-btn-$ref'),
-                        onPressed: () => onResume(ref),
-                        child: Text(state == DownloadState.cancelled ? 'Resume' : 'Retry'),
-                      ),
                   ],
                 );
               },

@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:app/dev/fake_node_service.dart';
+import 'package:app/util/format.dart';
+import 'package:llmmbc_core/llmmbc_core.dart';
 
 import 'helpers/test_app.dart';
 
@@ -35,18 +37,71 @@ void main() {
     expect(find.textContaining('Cluster Queen'), findsWidgets);
   });
 
-  testWidgets('memory share slider updates the memory share', (tester) async {
+  testWidgets('memory basis defaults to Total RAM and the preview follows the slider', (tester) async {
     final session = await testSession();
     await pumpApp(tester, session);
     await openTab(tester, 'Settings');
 
-    expect(fakeOf(session).settings.memoryShare, 0.8);
+    // Defaults from the contract: total basis, 70%.
+    expect(fakeOf(session).settings.memoryBasis, MemoryBasis.total);
+    expect(fakeOf(session).settings.memoryShare, kDefaultMemoryShare);
+    expect(find.text('Total RAM'), findsWidgets);
+    expect(find.text('Free RAM estimate'), findsOneWidget);
+    expect(find.textContaining('Lends a share of all installed memory'), findsOneWidget);
+    // Android demo hardware shows the over-promise warning.
+    expect(find.byKey(const Key('memory-basis-warning')), findsOneWidget);
+
+    final hardware = session.hardware;
+    final expected = hardware.memoryBudgetBytes(MemoryBasis.total, kDefaultMemoryShare);
+    expect(find.textContaining('Lends ${formatBytes(expected)} of'), findsOneWidget);
+    expect(find.textContaining('(Total RAM)'), findsOneWidget);
+
     await tester.ensureVisible(find.byKey(const Key('memory-slider')));
     await tester.pumpAndSettle();
     await tester.drag(find.byKey(const Key('memory-slider')), const Offset(-160, 0));
     await tester.pumpAndSettle();
 
-    expect(fakeOf(session).settings.memoryShare, lessThan(0.8));
+    expect(fakeOf(session).settings.memoryShare, lessThan(kDefaultMemoryShare));
+    final share = fakeOf(session).settings.memoryShare;
+    final budget = hardware.memoryBudgetBytes(MemoryBasis.total, share);
+    expect(find.textContaining('Lends ${formatBytes(budget)} of'), findsOneWidget);
+  });
+
+  testWidgets('switching to Free RAM estimate persists and updates the preview', (tester) async {
+    final session = await testSession();
+    await pumpApp(tester, session);
+    await openTab(tester, 'Settings');
+
+    await tapVisible(tester, find.text('Free RAM estimate'));
+    await tester.pumpAndSettle();
+
+    expect(fakeOf(session).settings.memoryBasis, MemoryBasis.available);
+    expect(find.textContaining('Lends a share of what is free right now'), findsOneWidget);
+    expect(find.byKey(const Key('memory-basis-warning')), findsNothing);
+
+    final hardware = session.hardware;
+    final budget = hardware.memoryBudgetBytes(MemoryBasis.available, session.service.settings.memoryShare);
+    expect(find.textContaining('Lends ${formatBytes(budget)} of'), findsOneWidget);
+    expect(find.textContaining('(Free RAM estimate)'), findsOneWidget);
+
+    // Switching back round-trips through updateSettings too.
+    await tapVisible(tester, find.text('Total RAM'));
+    await tester.pumpAndSettle();
+    expect(fakeOf(session).settings.memoryBasis, MemoryBasis.total);
+  });
+
+  testWidgets('memory share slider updates the memory share', (tester) async {
+    final session = await testSession();
+    await pumpApp(tester, session);
+    await openTab(tester, 'Settings');
+
+    expect(fakeOf(session).settings.memoryShare, kDefaultMemoryShare);
+    await tester.ensureVisible(find.byKey(const Key('memory-slider')));
+    await tester.pumpAndSettle();
+    await tester.drag(find.byKey(const Key('memory-slider')), const Offset(-160, 0));
+    await tester.pumpAndSettle();
+
+    expect(fakeOf(session).settings.memoryShare, lessThan(kDefaultMemoryShare));
   });
 
   testWidgets('manual peers can be added and removed', (tester) async {

@@ -126,14 +126,16 @@ class _ClusterScreenState extends State<ClusterScreen> {
                               caption: 'right now',
                             ),
                             InfoStat(
-                              label: 'Usable for sessions',
-                              value: formatBytes(hardware.usableMemoryBytes),
-                              caption: 'RAM minus safety reserve + VRAM',
+                              label: 'Session budget',
+                              value: formatBytes(_session.memoryBudgetBytes),
+                              caption: '${settings.memoryBasis == MemoryBasis.total ? 'total' : 'free'} RAM '
+                                  '× ${formatPercent(settings.memoryShare)}',
                             ),
                             InfoStat(
                               label: 'Memory lent',
                               value: formatPercent(settings.memoryShare),
-                              caption: '${formatBytes(_session.usableShareBytes)} shared',
+                              caption: 'of ${formatBytes(_session.memoryBasisBytes)} '
+                                  '(${settings.memoryBasis == MemoryBasis.total ? 'Total RAM' : 'Free RAM estimate'})',
                             ),
                           ],
                         ),
@@ -331,7 +333,7 @@ class _PeerRow extends StatelessWidget {
                     if (!peer.engineAvailable)
                       const MetaChip(label: 'no engine', icon: Icons.warning_amber_outlined),
                     MetaChip(
-                      label: '${formatBytes(peer.hardware.usableMemoryBytes)} usable',
+                      label: '${formatBytes(peer.effectiveBudgetBytes)} budget',
                       icon: Icons.memory,
                     ),
                     MetaChip(label: formatRelativeTime(peer.lastSeen), icon: Icons.schedule),

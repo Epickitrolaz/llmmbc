@@ -320,6 +320,20 @@ class AppSession extends ChangeNotifier {
     await updateSettings(_service.settings.copyWith(memoryShare: share.clamp(0.1, 1.0)));
   }
 
+  Future<void> setMemoryBasis(MemoryBasis basis) async {
+    if (basis == _service.settings.memoryBasis) return;
+    await updateSettings(_service.settings.copyWith(memoryBasis: basis));
+  }
+
+  /// Bytes this node advertises to the cluster (docs/ARCHITECTURE.md §2.5).
+  int get memoryBudgetBytes =>
+      _service.hardware.memoryBudgetBytes(_service.settings.memoryBasis, _service.settings.memoryShare);
+
+  /// Size of the pool [memoryBasis] draws from, before the share is applied.
+  int get memoryBasisBytes => _service.settings.memoryBasis == MemoryBasis.total
+      ? _service.hardware.totalRamBytes + _service.hardware.vramBytes
+      : _service.hardware.usableMemoryBytes;
+
   /// Adds a manual peer; returns the peer or null when unreachable.
   Future<NodeInfo?> addManualPeer(String hostPort) async {
     final node = await _service.discovery.addManualPeer(hostPort);
@@ -353,9 +367,6 @@ class AppSession extends ChangeNotifier {
     notifyListeners();
     await prefs.save({'themeMode': mode.name});
   }
-
-  int get usableShareBytes =>
-      (_service.hardware.usableMemoryBytes * _service.settings.memoryShare).round();
 
   @override
   void dispose() {

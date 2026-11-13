@@ -365,7 +365,7 @@ class _ModelBar extends StatelessWidget {
     final selected = model;
     final memory = selected == null
         ? 0
-        : selected.candidates.fold<int>(0, (sum, node) => sum + node.hardware.usableMemoryBytes);
+        : selected.candidates.fold<int>(0, (sum, node) => sum + node.effectiveBudgetBytes);
     return Material(
       color: scheme.surface,
       shape: RoundedRectangleBorder(
@@ -445,7 +445,7 @@ class _ModelBar extends StatelessWidget {
                             label: pluralize(selected.candidates.length, 'candidate'),
                             icon: Icons.hub_outlined,
                           ),
-                          MetaChip(label: '${formatBytes(memory)} cluster RAM', icon: Icons.memory),
+                          MetaChip(label: '${formatBytes(memory)} cluster budget', icon: Icons.memory),
                         ],
                       ),
               ),
@@ -590,7 +590,7 @@ class _ChatEmptyState extends StatelessWidget {
               const EmptyState(
                 icon: Icons.forum_outlined,
                 title: 'Ask the cluster anything',
-                message: 'The request goes to the candidate with the most usable memory. '
+                message: 'The request goes to the candidate with the largest memory budget. '
                     'Answers stream back token by token and markdown is rendered as it arrives.',
                 compact: true,
               ),
@@ -890,7 +890,7 @@ class _ModelPickerSheet extends StatelessWidget {
                   final active = model.ref == selected;
                   final memory = model.candidates.fold<int>(
                     0,
-                    (sum, node) => sum + node.hardware.usableMemoryBytes,
+                    (sum, node) => sum + node.effectiveBudgetBytes,
                   );
                   return ListTile(
                     key: Key('model-option-${model.ref}'),
@@ -915,7 +915,7 @@ class _ModelPickerSheet extends StatelessWidget {
                     ),
                     subtitle: Text(
                       '${formatBytes(model.sizeBytes)} · ${pluralize(model.candidates.length, 'candidate')} · '
-                      '${formatBytes(memory)} usable',
+                      '${formatBytes(memory)} budget',
                       style: theme.textTheme.bodySmall,
                     ),
                     trailing: active ? Icon(Icons.check, color: scheme.primary) : null,
