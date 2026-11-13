@@ -1,0 +1,9 @@
+# Compose override used by docker/e2e/run.sh for the worker-mode toggle
+# acceptance (issue #48): restart node-b as a non-worker while keeping its
+# models and data volume intact.
+#
+#   docker compose -f compose.yaml -f worker-off.yaml up -d --no-deps --force-recreate node-b
+services:
+  node-b:
+    environment:
+      LLMMBC_WORKER: "0"
