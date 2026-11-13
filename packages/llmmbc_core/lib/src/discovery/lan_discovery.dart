@@ -83,6 +83,7 @@ class LanDiscovery implements Discovery {
   /// budget and a cancelled stop does not leave work behind (#19).
   Future<void>? _scanFuture;
   _ScanToken? _scanToken;
+  HttpNodeClient? _sweepClient;
 
   LanDiscovery({
     NodeClient? client,
@@ -161,6 +162,8 @@ class LanDiscovery implements Discovery {
     if (!_started) return;
     _started = false;
     _scanToken?.cancelled = true;
+    _sweepClient?.close();
+    _sweepClient = null;
     _beaconTimer?.cancel();
     _beaconTimer = null;
     _maintenanceTimer?.cancel();
@@ -372,17 +375,19 @@ class LanDiscovery implements Discovery {
     }());
   }
 
-  Future<NodeInfo?> _fetch(Uri base, Duration timeout) async {
+  Future<NodeInfo?> _fetch(Uri base, Duration timeout,
+      {NodeClient? client}) async {
     try {
-      final client = _client;
-      if (client is HttpNodeClient) {
-        // HttpNodeClient enforces the timeout (and aborts the connect phase at
-        // the socket level), so a slow host cannot accumulate abandoned probes.
-        return await client.info(base, timeout: timeout);
+      final effective = client ?? _client;
+      if (effective is HttpNodeClient) {
+        // HttpNodeClient enforces the timeout (and its HttpClient connection
+        // timeout aborts unreachable hosts at the socket level), so an
+        // abandoned probe cannot keep counting against the concurrency bound.
+        return await effective.info(base, timeout: timeout);
       }
       // Injected clients (tests) own their own completion semantics; awaiting
       // them keeps the <=64 in-flight bound exact.
-      return await client.info(base);
+      return await effective.info(base);
     } catch (_) {
       return null;
     }
@@ -630,6 +635,13 @@ class LanDiscovery implements Discovery {
     }
 
     final hosts = targets.toList();
+    // A dedicated client whose connection timeout matches the sweep timeout, so
+    // dead hosts fail at the socket level and close() on stop aborts the rest.
+    final shared = _client;
+    final sweepClient =
+        shared is HttpNodeClient ? HttpNodeClient(timeout: sweepTimeout) : null;
+    _sweepClient = sweepClient;
+    final client = sweepClient ?? shared;
     var next = 0;
     Future<void> worker() async {
       while (!token.cancelled) {
@@ -637,7 +649,8 @@ class LanDiscovery implements Discovery {
         if (index >= hosts.length) return;
         final host = hosts[index];
         final info = await _fetch(
-            Uri(scheme: 'http', host: host, port: port), sweepTimeout);
+            Uri(scheme: 'http', host: host, port: port), sweepTimeout,
+            client: client);
         if (token.cancelled) return;
         if (info == null || info.nodeId == _selfId) continue;
         final manual = _peers[info.nodeId]?.manual ?? false;
@@ -648,7 +661,12 @@ class LanDiscovery implements Discovery {
     final count = sweepConcurrency < 1
         ? 1
         : (sweepConcurrency > hosts.length ? hosts.length : sweepConcurrency);
-    await Future.wait([for (var i = 0; i < count; i++) worker()]);
+    try {
+      await Future.wait([for (var i = 0; i < count; i++) worker()]);
+    } finally {
+      sweepClient?.close();
+      if (identical(_sweepClient, sweepClient)) _sweepClient = null;
+    }
   }
 
   void _emitPeers() {
