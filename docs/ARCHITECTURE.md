@@ -86,6 +86,19 @@ All JSON bodies use the `toJson()` shapes in `lib/src/models.dart`. Errors: `{"e
 
 Headers: every response carries `X-LLMMBC-Protocol: 1` and `X-LLMMBC-Node: <nodeId>`.
 
+**Chat routing on the API.** `POST /v1/chat/completions` may be sent to *any* node (e.g. a
+client-only node, or the CLI `chat --node`). Without the request header `X-LLMMBC-Route: coordinator`
+the receiving node acts as requester R and routes per §2.3 (`NodeService.chat`): if it is itself the
+chosen coordinator it serves locally, otherwise it forwards to C adding `X-LLMMBC-Route: coordinator`.
+A request carrying that header is served locally as coordinator or rejected (`not_candidate` /
+`busy`), never forwarded again (no routing loops).
+
+**Reasoning output.** Reasoning models emit `reasoning_content` deltas. The node passes them through
+unchanged on the wire; `HttpNodeClient`/`NodeService.chat` surface them inside `ChatDelta.content`
+wrapped in `<think>` … `</think>` so clients that only read `content` still get a non-empty answer.
+Chat calls use a long first-byte timeout (≥ 10 min; model load on the coordinator), not the 5 s API
+timeout.
+
 ## 4. Discovery protocol (UDP 47100)
 
 * Beacon: every 3 s, each node sends a UTF-8 JSON datagram
