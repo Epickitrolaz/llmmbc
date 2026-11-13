@@ -398,8 +398,15 @@ class FileModelStore implements ModelStore {
 
   void _emit(_PullJob job, DownloadProgress progress, {required bool force}) {
     job.current = progress;
+    // Always surface the first downloading event. On a fast runner a whole pull can finish
+    // inside the throttle interval, which used to drop every downloading event between
+    // `resolving` and `verifying` (observed in CI with the small test model).
+    final firstDownloading =
+        progress.state == DownloadState.downloading && !job.emittedDownloading;
+    if (firstDownloading) job.emittedDownloading = true;
     final now = DateTime.now();
     if (!force &&
+        !firstDownloading &&
         job.lastEmit != null &&
         now.difference(job.lastEmit!) < _progressInterval) {
       return;
@@ -912,6 +919,7 @@ class _PullJob {
   final http.Client client = http.Client();
   DownloadProgress current;
   DateTime? lastEmit;
+  bool emittedDownloading = false;
   bool cancelled = false;
   bool closed = false;
   void Function()? abort;

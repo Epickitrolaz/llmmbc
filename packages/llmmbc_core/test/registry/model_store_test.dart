@@ -227,7 +227,7 @@ void main() {
       states.add(progress.state);
       if (!cancelRequested &&
           progress.state == DownloadState.downloading &&
-          progress.receivedBytes > 0) {
+          progress.receivedBytes > 1024) {
         cancelRequested = true;
         unawaited(store.cancel(ref));
       }
@@ -421,6 +421,16 @@ void main() {
     expect(downloadingEvents, lessThanOrEqualTo(10),
         reason: 'expected throttling, got $downloadingEvents of $chunks chunks');
     expect(events.last.state, DownloadState.done);
+  });
+
+  test('always emits a downloading event, even when the whole pull is instant', () async {
+    // Regression: on fast CI runners the throttle used to drop every downloading event
+    // between resolving and verifying for a small in-process download.
+    addQwen();
+    final states =
+        await store.pull(ModelRef.parse('qwen3:0.6b')).map((event) => event.state).toList();
+    expect(states, contains(DownloadState.downloading));
+    expect(states.last, DownloadState.done);
   });
 
   test('delete removes the manifest and garbage-collects unreferenced blobs', () async {
