@@ -38,12 +38,60 @@ void main() {
     await pumpApp(tester, session);
     await openTab(tester, 'Cluster');
 
+    expect(find.text('Rescan network'), findsOneWidget);
     await tapVisible(tester, find.byKey(const Key('cluster-refresh')));
     await tester.pump();
     expect(find.text('Scanning…'), findsOneWidget);
     await tester.pumpAndSettle();
     expect(find.text('Scanning…'), findsNothing);
     expect(find.text('Studio PC'), findsOneWidget);
+  });
+
+  testWidgets('peer list follows live peersChanged events while open and after returning', (tester) async {
+    final session = await testSession();
+    await pumpApp(tester, session);
+    await openTab(tester, 'Cluster');
+
+    expect(find.text('4 peers known · 4 reachable'), findsOneWidget);
+
+    // Liveness changes while the tab is open update the list immediately.
+    fakeOf(session).debugSetPeerReachable(
+      'studio-pc-7d21c4a0',
+      lastSeenAgo: const Duration(seconds: 45),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('4 peers known · 3 reachable'), findsOneWidget);
+    expect(find.text('offline'), findsOneWidget);
+    expect(
+      find.byWidgetPredicate(
+        (widget) => widget is Text && RegExp(r'^last seen \d+s ago$').hasMatch(widget.data ?? ''),
+      ),
+      findsOneWidget,
+    );
+
+    // A recovery refreshes lastSeen and reachability without a manual scan.
+    fakeOf(session).debugSetPeerReachable(
+      'studio-pc-7d21c4a0',
+      reachable: true,
+      lastSeenAgo: const Duration(seconds: 1),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('4 peers known · 4 reachable'), findsOneWidget);
+    expect(find.textContaining('last seen'), findsNothing);
+
+    // Leave the tab, let discovery report the peer offline, then come back.
+    await openTab(tester, 'Chat');
+    fakeOf(session).debugSetPeerReachable(
+      'studio-pc-7d21c4a0',
+      lastSeenAgo: const Duration(seconds: 50),
+    );
+    await tester.pumpAndSettle();
+    await openTab(tester, 'Cluster');
+
+    expect(find.text('4 peers known · 3 reachable'), findsOneWidget);
+    expect(find.textContaining('last seen'), findsOneWidget);
+    expect(find.byKey(const Key('cluster-live-copy')), findsOneWidget);
   });
 
   testWidgets('add peer reports unreachable addresses and adds reachable ones', (tester) async {

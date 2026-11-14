@@ -47,6 +47,7 @@ class FakeNodeService implements NodeService {
     this.scanLatency = const Duration(milliseconds: 350),
     this.engineAvailable = true,
     this.pullFailure,
+    this.peerBudgetOverride,
   }) {
     _models = _FakeModelStore(this);
     _discovery = _FakeDiscovery(this);
@@ -94,6 +95,10 @@ class FakeNodeService implements NodeService {
   /// When set, every pull fails with this error (tests and the error UX demo).
   final Object? pullFailure;
 
+  /// Overrides the memory budget every demo peer advertises. Lets tests and
+  /// demos exercise the planner fit hints without changing this device's share.
+  final int? peerBudgetOverride;
+
   /// Set to throw from [chat] (tests and the error UX demo).
   Object? chatFailure;
 
@@ -115,6 +120,7 @@ class FakeNodeService implements NodeService {
     manualPeers: const ['192.168.1.20:47101'],
     memoryShare: kDefaultMemoryShare,
     memoryBasis: MemoryBasis.total,
+    allowExpertStreaming: false,
   );
 
   @override
@@ -302,6 +308,22 @@ class FakeNodeService implements NodeService {
     notifyChanged();
   }
 
+  /// Test hook: flips a demo peer's liveness without a scan, mirroring the
+  /// `peersChanged` event the real discovery emits when HTTP probes fail.
+  void debugSetPeerReachable(
+    String nodeId, {
+    bool reachable = false,
+    Duration lastSeenAgo = const Duration(seconds: 30),
+  }) {
+    final seenAt = DateTime.now().subtract(lastSeenAgo);
+    _peers = [
+      for (final peer in _peers)
+        if (peer.nodeId == nodeId) peer.copyWith(reachable: reachable, lastSeen: seenAt) else peer,
+    ];
+    _discovery._emit();
+    notifyChanged();
+  }
+
   List<String> _chunk(String text) {
     final words = text.split(RegExp(r'(?<=\s)'));
     final chunks = <String>[];
@@ -351,6 +373,9 @@ llama-server --model $model --rpc worker1:47102,worker2:47102 \\
 > Everything above is demo data. Start the app without `LLMMBC_FAKE` to talk to a real node.
 ''';
   }
+
+  int _peerBudget(HardwareProfile hardware) =>
+      peerBudgetOverride ?? hardware.memoryBudgetBytes(MemoryBasis.total, kDefaultMemoryShare);
 
   List<NodeInfo> _seedPeers() {
     final studio = HardwareProfile(
@@ -421,7 +446,7 @@ llama-server --model $model --rpc worker1:47102,worker2:47102 \\
             metadata: _denseMeta('llama', 28, 8192, 2 * _gib),
           ),
         ],
-        memoryBudgetBytes: studio.memoryBudgetBytes(MemoryBasis.total, kDefaultMemoryShare),
+        memoryBudgetBytes: _peerBudget(studio),
         lastSeen: now.subtract(const Duration(seconds: 2)),
       ),
       NodeInfo(
@@ -447,7 +472,7 @@ llama-server --model $model --rpc worker1:47102,worker2:47102 \\
             metadata: _moeMeta('granite_moe', 24, 4096, 32, 4, 1400 * _mib),
           ),
         ],
-        memoryBudgetBytes: pixel.memoryBudgetBytes(MemoryBasis.total, kDefaultMemoryShare),
+        memoryBudgetBytes: _peerBudget(pixel),
         lastSeen: now.subtract(const Duration(seconds: 5)),
       ),
       NodeInfo(
@@ -467,7 +492,7 @@ llama-server --model $model --rpc worker1:47102,worker2:47102 \\
             metadata: _moeMeta('granite_moe', 24, 4096, 32, 4, 1400 * _mib),
           ),
         ],
-        memoryBudgetBytes: pi.memoryBudgetBytes(MemoryBasis.total, kDefaultMemoryShare),
+        memoryBudgetBytes: _peerBudget(pi),
         lastSeen: now.subtract(const Duration(minutes: 1)),
       ),
       NodeInfo(
@@ -480,7 +505,7 @@ llama-server --model $model --rpc worker1:47102,worker2:47102 \\
         status: NodeStatus.idle,
         hardware: tablet,
         models: const [],
-        memoryBudgetBytes: tablet.memoryBudgetBytes(MemoryBasis.total, kDefaultMemoryShare),
+        memoryBudgetBytes: _peerBudget(tablet),
         lastSeen: now.subtract(const Duration(minutes: 3)),
       ),
     ];

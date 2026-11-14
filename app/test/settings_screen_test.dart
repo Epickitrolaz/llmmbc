@@ -18,7 +18,19 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(fakeOf(session).settings.workerEnabled, isFalse);
-    expect(find.text('OFF'), findsOneWidget);
+    expect(
+      find.descendant(of: find.byKey(const Key('worker-toggle')), matching: find.text('OFF')),
+      findsOneWidget,
+    );
+    // The expert streaming toggle has its own status pill and stays off.
+    expect(fakeOf(session).settings.allowExpertStreaming, isFalse);
+    expect(
+      find.descendant(
+        of: find.byKey(const Key('expert-streaming-toggle')),
+        matching: find.text('OFF'),
+      ),
+      findsOneWidget,
+    );
     // Own models are no longer candidates when worker mode is off.
     final granite = session.service.clusterModels().where((m) => m.ref.toString() == 'granite3.1-moe:1b');
     expect(granite.first.candidates.any((node) => node.isSelf), isFalse);
@@ -102,6 +114,33 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(fakeOf(session).settings.memoryShare, lessThan(kDefaultMemoryShare));
+  });
+
+  testWidgets('expert streaming toggle is off by default, persists and explains the trade-off', (tester) async {
+    final session = await testSession();
+    await pumpApp(tester, session);
+    await openTab(tester, 'Settings');
+
+    expect(fakeOf(session).settings.allowExpertStreaming, isFalse);
+    final toggle = find.byKey(const Key('expert-streaming-toggle'));
+    expect(toggle, findsOneWidget);
+    expect(tester.widget<SwitchListTile>(toggle).value, isFalse);
+    expect(find.text('Allow MoE models larger than cluster memory'), findsOneWidget);
+    expect(find.textContaining("Expert weights stream from each worker's own storage"), findsOneWidget);
+    expect(find.textContaining('Applies when this device coordinates'), findsOneWidget);
+    expect(find.textContaining('MoE models only'), findsOneWidget);
+
+    await tapVisible(tester, toggle);
+    await tester.pumpAndSettle();
+
+    expect(fakeOf(session).settings.allowExpertStreaming, isTrue);
+    expect(tester.widget<SwitchListTile>(toggle).value, isTrue);
+
+    // Turning it off again goes through updateSettings as well.
+    await tapVisible(tester, toggle);
+    await tester.pumpAndSettle();
+    expect(fakeOf(session).settings.allowExpertStreaming, isFalse);
+    expect(tester.widget<SwitchListTile>(toggle).value, isFalse);
   });
 
   testWidgets('manual peers can be added and removed', (tester) async {
