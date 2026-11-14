@@ -144,6 +144,8 @@ Future<void> _serve(ArgResults command) async {
       '${formatByteSize(service.self.memoryBudgetBytes)} '
       '(basis ${service.settings.memoryBasis.name}, '
       'share ${service.settings.memoryShare.toStringAsFixed(2)})');
+  stdout.writeln('expert streaming: '
+      '${service.settings.allowExpertStreaming ? "enabled" : "disabled"}');
   stdout.writeln('peers: ${service.discovery.peers.length}');
 
   final changed = service.changed.listen((_) {

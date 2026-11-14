@@ -41,6 +41,7 @@ Harness buildHarness({
   Duration modelRefreshInterval = const Duration(seconds: 10),
   double memoryShare = kDefaultMemoryShare,
   MemoryBasis memoryBasis = MemoryBasis.total,
+  bool allowExpertStreaming = false,
   FakeEngine? engine,
   FakePlanner? planner,
   FakeNodeClient? client,
@@ -64,6 +65,7 @@ Harness buildHarness({
     workerEnabled: workerEnabled,
     memoryShare: memoryShare,
     memoryBasis: memoryBasis,
+    allowExpertStreaming: allowExpertStreaming,
   );
   final fakeEngine = engine ?? FakeEngine();
   final fakePlanner = planner ?? FakePlanner();
@@ -126,6 +128,27 @@ void main() {
       expect(h.service.self.apiPort, greaterThan(0));
       expect(h.probe.scans, 1);
       await sub.cancel();
+    });
+
+    test('deletes the legacy rpc-cache on startup (§6.1)', () async {
+      final h = buildHarness();
+      final cache = Directory('${h.dir.path}/rpc-cache')
+        ..createSync(recursive: true);
+      Directory('${cache.path}/nested').createSync();
+      File('${cache.path}/blob.bin').writeAsBytesSync(List.filled(1024, 1));
+      File('${cache.path}/nested/more.bin')
+          .writeAsBytesSync(List.filled(24, 1));
+
+      await h.service.start();
+
+      expect(cache.existsSync(), isFalse);
+      expect(h.service.debugRpcCacheBytesReclaimed, 1048);
+    });
+
+    test('a missing rpc-cache is not an error', () async {
+      final h = buildHarness();
+      await h.service.start();
+      expect(h.service.debugRpcCacheBytesReclaimed, 0);
     });
 
     test('create persists a nodeId and defaults the name to the hostname',
@@ -569,6 +592,22 @@ void main() {
       );
     });
 
+    test('serves the session model from disk with lazy weights, no cacheDir',
+        () async {
+      final model = localModel('qwen3:0.6b');
+      final h = buildHarness(models: [model]);
+      await h.service.start();
+      await h.service.handleRpcStart(
+        sessionId: 's1',
+        model: ModelRef.parse('qwen3:0.6b'),
+        coordinatorId: 'c',
+      );
+
+      expect(h.engine.lastRpcModelPath, model.ggufPath);
+      expect(h.engine.lastRpcLazyWeights, isTrue);
+      expect(h.engine.lastRpcCacheDir, isNull);
+    });
+
     test(
         'starts one rpc worker, is idempotent for the same session and busy otherwise',
         () async {
@@ -754,6 +793,31 @@ void main() {
       expect(h.engine.coordinatorStops, greaterThanOrEqualTo(1));
       expect(h.client.stopRpcCalls.map((c) => c.base.port), contains(50001));
       expect(h.service.self.status, NodeStatus.idle);
+    });
+
+    test('passes allowExpertStreaming to the planner and the session plan',
+        () async {
+      final h = buildHarness(
+        models: [localModel('granite3.1-moe:1b')],
+        allowExpertStreaming: true,
+      );
+      await h.service.start();
+      await h.service.chat(ModelRef.parse('granite3.1-moe:1b'),
+          [const ChatMessage('user', 'hi')]).toList();
+
+      expect(h.planner.lastAllowExpertStreaming, isTrue);
+      expect(h.service.currentSession!.plan!['allowExpertStreaming'], isTrue);
+    });
+
+    test('expert streaming defaults to off', () async {
+      final h = buildHarness(models: [localModel('qwen3:0.6b')]);
+      await h.service.start();
+      await h.service.chat(ModelRef.parse('qwen3:0.6b'),
+          [const ChatMessage('user', 'hi')]).toList();
+
+      expect(h.planner.lastAllowExpertStreaming, isFalse);
+      expect(
+          h.service.currentSession!.plan!['allowExpertStreaming'], isFalse);
     });
 
     test('restarts the session when the model changes', () async {

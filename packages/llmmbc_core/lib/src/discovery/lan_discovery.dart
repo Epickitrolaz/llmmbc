@@ -10,16 +10,42 @@ import '../constants.dart';
 import '../interfaces.dart';
 import '../models.dart';
 
+/// How often a peer that has gone quiet is checked over HTTP (§4).
+const Duration kPeerProbeInterval = Duration(seconds: 5);
+
+/// `GET /v1/node` timeout for a liveness probe (§4).
+const Duration kPeerProbeTimeout = Duration(seconds: 2);
+
+/// Consecutive failed probes before a peer is shown as unreachable (§4).
+const int kPeerProbeFailures = 3;
+
+/// How often an unresolved/unreachable manual peer spec is retried (#76).
+const Duration kManualPeerRetryInterval = Duration(seconds: 15);
+
+class _ManualRetry {
+  DateTime? lastAttempt;
+  bool inFlight = false;
+}
+
 class _PeerEntry {
   NodeInfo info;
   DateTime lastSeen;
   DateTime lastFetched;
+  DateTime lastProbed;
   bool reachable = true;
   bool manual;
 
+  /// Consecutive failed HTTP liveness probes; reset by a beacon, a successful
+  /// probe or any other `/v1/node` fetch.
+  int failures = 0;
+
+  /// True while this peer has a probe in flight, so probes never overlap.
+  bool probing = false;
+
   _PeerEntry(this.info, this.lastSeen,
-      {DateTime? lastFetched, this.manual = false})
-      : lastFetched = lastFetched ?? lastSeen;
+      {DateTime? lastFetched, DateTime? lastProbed, this.manual = false})
+      : lastFetched = lastFetched ?? lastSeen,
+        lastProbed = lastProbed ?? lastSeen;
 }
 
 class _ScanToken {
@@ -76,6 +102,11 @@ class LanDiscovery implements Discovery {
   final bool sweepEnabled;
   final Duration sweepTimeout;
   final int sweepConcurrency;
+  final Duration probeInterval;
+  final Duration probeTimeout;
+  final int probeFailures;
+  final int probeConcurrency;
+  final Duration manualRetryInterval;
   final Future<List<InternetAddress>> Function()? localAddresses;
   final Future<Map<String, int>> Function()? netmaskResolver;
 
@@ -94,6 +125,7 @@ class LanDiscovery implements Discovery {
   final Map<String, _PeerEntry> _peers = {};
   final Set<String> _resolving = {};
   final Set<String> _manualSpecs = {};
+  final Map<String, _ManualRetry> _manualRetries = {};
   final StreamController<List<NodeInfo>> _peersChanged =
       StreamController<List<NodeInfo>>.broadcast();
   List<InternetAddress> _interfaceAddresses = const [];
@@ -106,6 +138,17 @@ class LanDiscovery implements Discovery {
   _ScanToken? _scanToken;
   HttpNodeClient? _sweepClient;
 
+  /// Peers whose HTTP liveness probe is in flight; never probed twice at once.
+  int _activeProbes = 0;
+  final Set<Future<void>> _inFlightProbes = {};
+
+  /// Maintenance retries of unresolved/unreachable manual peer specs (#76).
+  final Set<Future<void>> _inFlightManualRetries = {};
+
+  /// Per-probe clients, force-closed on [stop] so an in-flight probe against a
+  /// stalled peer never outlives discovery (#75).
+  final Set<HttpClient> _activeProbeClients = {};
+
   LanDiscovery({
     NodeClient? client,
     PlatformHooks hooks = const PlatformHooks(),
@@ -113,6 +156,11 @@ class LanDiscovery implements Discovery {
     this.sweepEnabled = true,
     this.sweepTimeout = const Duration(milliseconds: 300),
     this.sweepConcurrency = 64,
+    this.probeInterval = kPeerProbeInterval,
+    this.probeTimeout = kPeerProbeTimeout,
+    this.probeFailures = kPeerProbeFailures,
+    this.probeConcurrency = 8,
+    this.manualRetryInterval = kManualPeerRetryInterval,
     this.localAddresses,
     this.netmaskResolver,
     this.defaultRouteResolver,
@@ -187,6 +235,14 @@ class LanDiscovery implements Discovery {
     _scanToken?.cancelled = true;
     _sweepClient?.close();
     _sweepClient = null;
+    for (final client in _activeProbeClients.toList()) {
+      try {
+        client.close(force: true);
+      } catch (_) {
+        // Already closed.
+      }
+    }
+    _activeProbeClients.clear();
     _beaconTimer?.cancel();
     _beaconTimer = null;
     _maintenanceTimer?.cancel();
@@ -280,11 +336,14 @@ class LanDiscovery implements Discovery {
     }
     if (host.isEmpty) return null;
 
-    // Remember the spec even when the peer is currently offline so later
-    // scans retry it (#20).
+    // Remember the spec even when the peer is currently offline so the
+    // maintenance loop can retry it without a manual scan (#20, #76).
     _manualSpecs.add(spec);
+    // Anchor the retry backoff to this attempt, whichever caller made it.
+    _manualRetries.putIfAbsent(spec, _ManualRetry.new).lastAttempt = _now();
 
-    final info = await _fetch(Uri(scheme: 'http', host: host, port: port),
+    final info = await _fetchInfo(
+        Uri(scheme: 'http', host: host, port: port),
         const Duration(seconds: 2));
     if (info == null) return null;
     if (info.nodeId == _selfId) {
@@ -302,6 +361,7 @@ class LanDiscovery implements Discovery {
     _manualSpecs
       ..clear()
       ..addAll(wanted);
+    _manualRetries.removeWhere((spec, _) => !wanted.contains(spec));
     for (final id in _peers.keys.toList()) {
       final entry = _peers[id]!;
       if (!entry.manual) continue;
@@ -368,6 +428,8 @@ class LanDiscovery implements Discovery {
       final changed = !wasReachable || entry.info.apiPort != port.toInt();
       entry.lastSeen = now;
       entry.reachable = true;
+      // A beacon proves liveness exactly like a successful probe (§4).
+      entry.failures = 0;
       // Refresh metadata periodically (models/worker/status can change) as well
       // as when the advertised endpoint moves (#21).
       final needsRefresh = entry.info.apiPort != port.toInt() ||
@@ -387,7 +449,8 @@ class LanDiscovery implements Discovery {
     if (!_resolving.add(id)) return;
     unawaited(() async {
       try {
-        final info = await _fetch(Uri(scheme: 'http', host: host, port: port),
+        final info = await _fetchInfo(
+            Uri(scheme: 'http', host: host, port: port),
             const Duration(seconds: 2));
         if (info == null || info.nodeId != id) return;
         final manual = _peers[id]?.manual ?? false;
@@ -444,7 +507,9 @@ class LanDiscovery implements Discovery {
     entry.info = info.copyWith(host: host, reachable: true, isSelf: false);
     entry.lastSeen = now;
     entry.lastFetched = now;
+    entry.lastProbed = now;
     entry.reachable = true;
+    entry.failures = 0;
     entry.manual = entry.manual || effectiveManual;
     _peers[info.nodeId] = entry;
     _emitPeers();
@@ -692,27 +757,162 @@ class LanDiscovery implements Discovery {
   // Maintenance / sweep
   // ---------------------------------------------------------------------------
 
+  /// Liveness + expiry pass (§4).
+  ///
+  /// UDP is not reliable on Wi-Fi/Android, so peers are also probed over HTTP:
+  /// every known peer not heard from (beacon or HTTP) in [probeInterval] is
+  /// probed with `GET /v1/node` ([probeTimeout]) at most once per
+  /// [probeInterval]. [probeFailures] consecutive failures mark it unreachable;
+  /// [kPeerDropAfter] without any contact drops it (manual peers are kept).
+  /// A successful probe or beacon makes it reachable again immediately.
   void _runMaintenance() {
     final now = _now();
     var changed = false;
     for (final id in _peers.keys.toList()) {
       final entry = _peers[id]!;
-      if (entry.manual) continue;
-      final age = now.difference(entry.lastSeen);
-      if (age > kPeerDropAfter) {
+      if (!entry.manual && now.difference(entry.lastSeen) > kPeerDropAfter) {
         _peers.remove(id);
-        changed = true;
-      } else if (age > kPeerStaleAfter && entry.reachable) {
-        entry.reachable = false;
         changed = true;
       }
     }
     if (changed) _emitPeers();
+
+    _probeQuietPeers(now);
+    _retryManualPeers(now);
+  }
+
+  /// Retries manual peer specs that have no entry yet or whose entry is
+  /// currently unreachable (#76). Without this, a peer that starts after this
+  /// node's startup scan is never discovered on a network that drops UDP until
+  /// the user presses Rescan.
+  void _retryManualPeers(DateTime now) {
+    if (_manualSpecs.isEmpty) return;
+    final entries = _peers.values.toList();
+    for (final spec in _manualSpecs.toList()) {
+      final matching =
+          entries.where((entry) => _specMatches(spec, entry.info)).toList();
+      if (matching.any((entry) => entry.reachable)) {
+        _manualRetries.remove(spec);
+        continue;
+      }
+      // A probe already in flight is the retry; do not stack a second request.
+      if (matching.any((entry) => entry.probing)) continue;
+      final state = _manualRetries.putIfAbsent(spec, _ManualRetry.new);
+      if (state.inFlight) continue;
+      final last = state.lastAttempt;
+      if (last != null && now.difference(last) < manualRetryInterval) continue;
+      state.lastAttempt = now;
+      state.inFlight = true;
+      late final Future<void> tracked;
+      tracked = addManualPeer(spec)
+          .then<void>((_) {})
+          .catchError((Object _) {})
+          .whenComplete(() {
+        state.inFlight = false;
+        _inFlightManualRetries.remove(tracked);
+      });
+      _inFlightManualRetries.add(tracked);
+    }
+  }
+
+  void _probeQuietPeers(DateTime now) {
+    for (final entry in _peers.values.toList()) {
+      if (entry.probing) continue;
+      if (now.difference(entry.lastSeen) < probeInterval) continue;
+      // Never probe more often than the liveness interval, even while a peer
+      // stays quiet and its probes keep failing.
+      if (now.difference(entry.lastProbed) < probeInterval) continue;
+      if (_activeProbes >= probeConcurrency) return;
+      _startProbe(entry);
+    }
+  }
+
+  void _startProbe(_PeerEntry entry) {
+    entry.probing = true;
+    entry.lastProbed = _now();
+    _activeProbes++;
+    late final Future<void> tracked;
+    tracked = _probe(entry).whenComplete(() {
+      entry.probing = false;
+      _activeProbes--;
+      _inFlightProbes.remove(tracked);
+    });
+    _inFlightProbes.add(tracked);
+  }
+
+  /// One liveness probe with its own [HttpClient].
+  ///
+  /// `package:http`'s `Future.timeout` only abandons the caller's future: the
+  /// socket stays ESTABLISHED until the peer answers (or the OS gives up), which
+  /// leaks one FD per probe against a stalled peer (#75). Here a hard timer
+  /// force-closes this probe's client, which aborts the request and releases
+  /// the socket immediately. `maxConnectionsPerHost = 1` plus the per-peer
+  /// single-flight flag bounds each peer to one probe connection.
+  Future<NodeInfo?> _httpProbe(Uri base, {Duration? timeout}) async {
+    final limit = timeout ?? probeTimeout;
+    final client = HttpClient()
+      ..connectionTimeout = limit
+      ..maxConnectionsPerHost = 1;
+    _activeProbeClients.add(client);
+    final deadline = Timer(limit, () => client.close(force: true));
+    try {
+      final request = await client.getUrl(base.resolve('/v1/node'));
+      request.headers.set(kHeaderProtocol, '$kProtocolVersion');
+      final response = await request.close();
+      if (response.statusCode != HttpStatus.ok) {
+        await response.drain<void>();
+        return null;
+      }
+      final body = await utf8.decoder.bind(response).join();
+      final info =
+          NodeInfo.fromJson(jsonDecode(body) as Map<String, dynamic>);
+      return info.host.isEmpty ? info.copyWith(host: base.host) : info;
+    } on Object {
+      // Timeouts, aborts and malformed responses all mean "not reachable now".
+      return null;
+    } finally {
+      deadline.cancel();
+      _activeProbeClients.remove(client);
+      client.close(force: true);
+    }
+  }
+
+  /// One `GET /v1/node` with a cancellable socket (see [_httpProbe]) when the
+  /// production HTTP client is in use; injected test clients own their own
+  /// completion semantics.
+  Future<NodeInfo?> _fetchInfo(Uri base, Duration timeout) =>
+      _client is HttpNodeClient
+          ? _httpProbe(base, timeout: timeout)
+          : _fetch(base, timeout, client: _client);
+
+  Future<void> _probe(_PeerEntry entry) async {
+    final info = await _fetchInfo(entry.info.baseUri, probeTimeout);
+    // The entry may have been dropped or replaced by a beacon/scan meanwhile.
+    if (!_started || !identical(_peers[entry.info.nodeId], entry)) return;
+    if (info != null) {
+      _upsert(info, host: entry.info.host, manual: entry.manual);
+      return;
+    }
+    entry.failures++;
+    if (entry.failures >= probeFailures && entry.reachable) {
+      entry.reachable = false;
+      _emitPeers();
+    }
+  }
+
+  Future<void> _waitForProbes() async {
+    while (_inFlightProbes.isNotEmpty || _inFlightManualRetries.isNotEmpty) {
+      final pending = [..._inFlightProbes, ..._inFlightManualRetries];
+      if (pending.isEmpty) return;
+      await Future.wait(pending);
+    }
   }
 
   @visibleForTesting
-  void debugSeedPeer(NodeInfo info, {bool manual = false, DateTime? lastSeen}) {
-    _peers[info.nodeId] = _PeerEntry(info, lastSeen ?? _now(), manual: manual);
+  void debugSeedPeer(NodeInfo info,
+      {bool manual = false, DateTime? lastSeen, DateTime? lastProbed}) {
+    _peers[info.nodeId] = _PeerEntry(info, lastSeen ?? _now(),
+        manual: manual, lastProbed: lastProbed ?? lastSeen ?? _now());
   }
 
   @visibleForTesting
@@ -722,6 +922,18 @@ class LanDiscovery implements Discovery {
 
   @visibleForTesting
   void debugRunMaintenance() => _runMaintenance();
+
+  /// Waits for every in-flight liveness probe to finish.
+  @visibleForTesting
+  Future<void> debugWaitForProbes() => _waitForProbes();
+
+  /// Runs one maintenance pass and waits for the probes it started, so tests
+  /// with a fake clock can observe the result deterministically.
+  @visibleForTesting
+  Future<void> debugRunMaintenanceAsync() async {
+    _runMaintenance();
+    await _waitForProbes();
+  }
 
   Future<void> _sweep(_ScanToken token) async {
     if (_interfaceAddresses.isEmpty) return;

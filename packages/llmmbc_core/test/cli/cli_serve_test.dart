@@ -13,6 +13,7 @@ NodeSettings _persisted({
   double share = 0.5,
   List<String> peers = const ['10.1.2.3:47101', 'peerbox:47101'],
   bool workerEnabled = false,
+  bool allowExpertStreaming = false,
 }) =>
     NodeSettings(
       nodeId: 'persisted-node',
@@ -23,6 +24,7 @@ NodeSettings _persisted({
       manualPeers: peers,
       memoryBasis: basis,
       memoryShare: share,
+      allowExpertStreaming: allowExpertStreaming,
     );
 
 void main() {
@@ -36,6 +38,7 @@ void main() {
           reason: 'the default port is not an override');
       expect(request.workerEnabled, isNull);
       expect(request.peers, isNull);
+      expect(request.allowExpertStreaming, isNull);
 
       final next = applyServeRequest(persisted, request);
       expect(next.memoryBasis, MemoryBasis.available);
@@ -162,6 +165,67 @@ void main() {
         environment: const {},
       );
       expect(applyServeRequest(persisted, request).apiPort, 0);
+    });
+
+    test('a plain serve keeps the persisted expert-streaming setting', () {
+      final persisted = _persisted(allowExpertStreaming: true);
+      final request = serveRequestFromArgs(
+        _parseServe(const []),
+        environment: const {},
+      );
+      expect(request.allowExpertStreaming, isNull);
+      expect(
+          applyServeRequest(persisted, request).allowExpertStreaming, isTrue);
+    });
+
+    test('--allow-expert-streaming / --no-... override the setting', () {
+      final enabled = applyServeRequest(
+        _persisted(),
+        serveRequestFromArgs(
+            _parseServe(const ['--allow-expert-streaming']),
+            environment: const {}),
+      );
+      expect(enabled.allowExpertStreaming, isTrue);
+
+      final disabled = applyServeRequest(
+        _persisted(allowExpertStreaming: true),
+        serveRequestFromArgs(
+            _parseServe(const ['--no-allow-expert-streaming']),
+            environment: const {}),
+      );
+      expect(disabled.allowExpertStreaming, isFalse);
+    });
+
+    test('LLMMBC_EXPERT_STREAMING=1|0 overrides the setting', () {
+      final enabled = applyServeRequest(
+        _persisted(),
+        serveRequestFromArgs(_parseServe(const []),
+            environment: const {'LLMMBC_EXPERT_STREAMING': '1'}),
+      );
+      expect(enabled.allowExpertStreaming, isTrue);
+
+      final disabled = applyServeRequest(
+        _persisted(allowExpertStreaming: true),
+        serveRequestFromArgs(_parseServe(const []),
+            environment: const {'LLMMBC_EXPERT_STREAMING': '0'}),
+      );
+      expect(disabled.allowExpertStreaming, isFalse);
+    });
+
+    test('a flag wins over LLMMBC_EXPERT_STREAMING', () {
+      final request = serveRequestFromArgs(
+        _parseServe(const ['--no-allow-expert-streaming']),
+        environment: const {'LLMMBC_EXPERT_STREAMING': '1'},
+      );
+      expect(request.allowExpertStreaming, isFalse);
+    });
+
+    test('rejects an invalid LLMMBC_EXPERT_STREAMING value', () {
+      expect(
+        () => serveRequestFromArgs(_parseServe(const []),
+            environment: const {'LLMMBC_EXPERT_STREAMING': 'maybe'}),
+        throwsFormatException,
+      );
     });
 
     test('rejects an invalid port or memory value', () {

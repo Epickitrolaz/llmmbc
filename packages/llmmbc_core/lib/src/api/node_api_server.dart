@@ -64,9 +64,17 @@ class NodeApiServer {
         final peers = _service.discovery.peers;
         await _json(response, {
           'peers': [
-            {...self.toJson(), 'isSelf': true},
+            {...self.toJson(), 'isSelf': true, 'reachable': true},
             for (final peer in peers)
-              {...peer.toJson(), if (peer.isSelf) 'isSelf': true}
+              {
+                ...peer.toJson(),
+                if (peer.isSelf) 'isSelf': true,
+                // Observer-side liveness (§4); `toJson` is the wire format sent
+                // by the peer itself and has no reachability field.
+                'reachable': peer.reachable,
+                if (peer.lastSeen != null)
+                  'lastSeen': peer.lastSeen!.toIso8601String(),
+              }
           ]
         });
       } else if (request.method == 'GET' && path == '/v1/models') {

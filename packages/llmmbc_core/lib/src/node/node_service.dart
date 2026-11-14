@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:http/http.dart' as http;
+import 'package:meta/meta.dart';
 import 'package:path/path.dart' as p;
 import 'package:uuid/uuid.dart';
 
@@ -87,6 +88,7 @@ class LocalNodeService implements NodeService {
   bool _running = false;
 
   NodeApiServer? _api;
+  int _rpcCacheBytesReclaimed = 0;
   _WorkerSession? _workerSession;
   _CoordinatorSession? _coordinatorSession;
   Future<void> _sessionQueue = Future.value();
@@ -375,6 +377,10 @@ class LocalNodeService implements NodeService {
   Future<void> start() async {
     if (_running) return;
     _running = true;
+
+    // §6.1: the legacy `rpc-server -c` hash cache is gone; weights are served
+    // from each worker's own GGUF. Reclaim the space once, before serving.
+    await _cleanupRpcCache();
 
     _emitPhase('settings');
     await _persistSettings();
@@ -670,17 +676,17 @@ class LocalNodeService implements NodeService {
     }
 
     final budget = _budgetBytes();
-    final cacheDir = p.join(_settings.dataDir, 'rpc-cache');
-    try {
-      await Directory(cacheDir).create(recursive: true);
-    } on FileSystemException {
-      // The engine will surface a meaningful error if this is fatal.
-    }
 
+    // §2.3 step 4 / §6.1: the worker serves the coordinator's load-from-file
+    // requests from its own GGUF; weights never cross the network. No legacy
+    // hash cache (`cacheDir`) is used.
     final int port;
     try {
       port = await _engine.startRpcWorker(
-          port: kRpcServerPort, cacheDir: cacheDir);
+        port: kRpcServerPort,
+        modelPath: local.ggufPath,
+        lazyWeights: true,
+      );
     } on Object catch (e) {
       throw _wrapEngineError(e);
     }
@@ -812,8 +818,11 @@ class LocalNodeService implements NodeService {
     }
 
     ClusterPlan plan;
+    final allowExpertStreaming = _settings.allowExpertStreaming;
     try {
-      plan = _planner.plan(local, planNodes);
+      // §2.4: expert streaming is the coordinator's opt-in setting.
+      plan = _planner.plan(local, planNodes,
+          allowExpertStreaming: allowExpertStreaming);
     } on PlanError catch (e) {
       await _stopWorkers(workerBases, sessionId);
       throw LlmmbcException('does_not_fit', e.message);
@@ -848,7 +857,8 @@ class LocalNodeService implements NodeService {
         workerIds: workerBases.keys.toList(),
         startedAt: now,
         lastUsedAt: now,
-        plan: plan.toJson(),
+        // Surface the §2.4 expert-streaming decision in GET /v1/session.
+        plan: {...plan.toJson(), 'allowExpertStreaming': allowExpertStreaming},
       ),
       engineUri: engineUri,
       candidateIds: candidateIds,
@@ -995,6 +1005,41 @@ class LocalNodeService implements NodeService {
     _sessionQueue = result.then<void>((_) {}, onError: (_) {});
     return result;
   }
+
+  /// Deletes `<dataDir>/rpc-cache/` left behind by the legacy `-c` hash cache
+  /// (§6.1) and logs the bytes reclaimed.
+  Future<void> _cleanupRpcCache() async {
+    final dir = Directory(p.join(_settings.dataDir, 'rpc-cache'));
+    if (!await dir.exists()) return;
+    var bytes = 0;
+    try {
+      await for (final entity in dir.list(recursive: true, followLinks: false)) {
+        if (entity is! File) continue;
+        try {
+          bytes += await entity.length();
+        } on FileSystemException {
+          // A file removed concurrently contributes nothing.
+        }
+      }
+    } on FileSystemException {
+      // Keep the best-effort byte count.
+    }
+    try {
+      await dir.delete(recursive: true);
+    } on FileSystemException {
+      return;
+    }
+    _rpcCacheBytesReclaimed = bytes;
+    try {
+      stdout.writeln('rpc-cache: removed $bytes bytes from ${dir.path}');
+    } on Object {
+      // Logging must never block startup.
+    }
+  }
+
+  /// Bytes reclaimed by the startup `rpc-cache` cleanup (tests/diagnostics).
+  @visibleForTesting
+  int get debugRpcCacheBytesReclaimed => _rpcCacheBytesReclaimed;
 
   Future<void> _persistSettings() async {
     try {
