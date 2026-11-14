@@ -275,6 +275,9 @@ class FakeEngine implements InferenceEngine {
   HttpServer? _server;
   int rpcStarts = 0;
   int rpcStops = 0;
+  String? lastRpcCacheDir;
+  String? lastRpcModelPath;
+  bool? lastRpcLazyWeights;
   int concurrentRpcStarts = 0;
   int maxConcurrentRpcStarts = 0;
   Completer<void>? startRpcGate;
@@ -298,6 +301,9 @@ class FakeEngine implements InferenceEngine {
       String? modelPath,
       bool lazyWeights = false}) async {
     rpcStarts++;
+    lastRpcCacheDir = cacheDir;
+    lastRpcModelPath = modelPath;
+    lastRpcLazyWeights = lazyWeights;
     concurrentRpcStarts++;
     if (concurrentRpcStarts > maxConcurrentRpcStarts) {
       maxConcurrentRpcStarts = concurrentRpcStarts;
@@ -383,11 +389,13 @@ class FakeEngine implements InferenceEngine {
 class FakePlanner implements ClusterPlanner {
   int plans = 0;
   bool fail = false;
+  bool? lastAllowExpertStreaming;
 
   @override
   ClusterPlan plan(LocalModel model, List<PlanNode> nodes,
       {bool allowExpertStreaming = false}) {
     plans++;
+    lastAllowExpertStreaming = allowExpertStreaming;
     if (fail) throw PlanError('model does not fit in cluster memory');
     final total = nodes.fold<int>(0, (sum, n) => sum + n.budgetBytes);
     return ClusterPlan(

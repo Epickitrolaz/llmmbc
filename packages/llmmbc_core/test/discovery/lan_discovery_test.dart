@@ -221,42 +221,153 @@ void main() {
     expect(discovery.debugBroadcastTargets(), contains('255.255.255.255'));
   });
 
-  test('stale peers become unreachable and are dropped; manual peers are kept',
-      () async {
-    final clock = FakeClock(DateTime(2025, 1, 1));
-    final discovery = LanDiscovery(
-      client: FakeNodeClient(),
-      sweepEnabled: false,
-      now: () => clock.now,
-    );
-    addTearDown(discovery.stop);
-    await discovery.start(
-      () => nodeInfo('self'),
-      const NodeSettings(
-          nodeId: 'self', name: 'self', dataDir: '/tmp/d', apiPort: 47101),
-    );
+  group('HTTP liveness (§4)', () {
+    Future<LanDiscovery> startedLiveness(
+      FakeClock clock,
+      FakeNodeClient client, {
+      int probeConcurrency = 8,
+    }) async {
+      final discovery = LanDiscovery(
+        client: client,
+        sweepEnabled: false,
+        now: () => clock.now,
+        probeConcurrency: probeConcurrency,
+      );
+      addTearDown(discovery.stop);
+      await discovery.start(
+        () => nodeInfo('self'),
+        const NodeSettings(
+            nodeId: 'self', name: 'self', dataDir: '/tmp/d', apiPort: 47101),
+      );
+      return discovery;
+    }
 
-    final changes = <List<NodeInfo>>[];
-    final sub = discovery.peersChanged.listen(changes.add);
-    discovery.debugSeedPeer(nodeInfo('auto', name: 'auto'),
-        lastSeen: clock.now);
-    discovery.debugSeedPeer(nodeInfo('manual', name: 'manual'),
-        manual: true, lastSeen: clock.now);
+    test('quiet peers that answer GET /v1/node stay reachable for 10 minutes',
+        () async {
+      final clock = FakeClock(DateTime(2025, 1, 1));
+      final client = FakeNodeClient()
+        ..infoByPort[47101] = nodeInfo('remote', name: 'remote', apiPort: 47101);
+      final discovery = await startedLiveness(clock, client);
+      discovery.debugSeedPeer(
+          nodeInfo('remote', name: 'remote', apiPort: 47101),
+          lastSeen: clock.now);
 
-    clock.advance(const Duration(seconds: 20));
-    discovery.debugRunMaintenance();
-    expect(discovery.peers.firstWhere((p) => p.nodeId == 'auto').reachable,
-        isFalse);
-    expect(discovery.peers.firstWhere((p) => p.nodeId == 'manual').reachable,
-        isTrue);
+      // No beacons at all: only the HTTP probes keep this peer alive.
+      final probesAtStart = client.infoCalls;
+      for (var i = 0; i < 120; i++) {
+        clock.advance(const Duration(seconds: 5));
+        await discovery.debugRunMaintenanceAsync();
+        final peer =
+            discovery.peers.singleWhere((p) => p.nodeId == 'remote');
+        expect(peer.reachable, isTrue,
+            reason: 'peer went offline after ${(i + 1) * 5}s without UDP');
+      }
+      expect(client.infoCalls - probesAtStart, greaterThan(60));
+    });
 
-    clock.advance(const Duration(seconds: 120));
-    discovery.debugRunMaintenance();
-    expect(discovery.peers.map((p) => p.nodeId), isNot(contains('auto')));
-    expect(discovery.peers.map((p) => p.nodeId), contains('manual'));
-    await Future<void>.delayed(Duration.zero);
-    expect(changes, isNotEmpty);
-    await sub.cancel();
+    test('3 failed probes mark it unreachable; a success restores it at once',
+        () async {
+      final clock = FakeClock(DateTime(2025, 1, 1));
+      final remote = nodeInfo('remote', name: 'remote', apiPort: 47101);
+      final client = FakeNodeClient()..infoByPort[47101] = remote;
+      final discovery = await startedLiveness(clock, client);
+      discovery.debugSeedPeer(remote, lastSeen: clock.now);
+
+      clock.advance(const Duration(seconds: 5));
+      await discovery.debugRunMaintenanceAsync();
+      expect(discovery.peers.single.reachable, isTrue);
+
+      // The node stops answering: the next three probes fail.
+      client.infoByPort.remove(47101);
+      clock.advance(const Duration(seconds: 5));
+      await discovery.debugRunMaintenanceAsync();
+      expect(discovery.peers.single.reachable, isTrue,
+          reason: 'one failure must not flap the peer');
+      clock.advance(const Duration(seconds: 5));
+      await discovery.debugRunMaintenanceAsync();
+      expect(discovery.peers.single.reachable, isTrue,
+          reason: 'two failures must not flap the peer');
+
+      clock.advance(const Duration(seconds: 5));
+      await discovery.debugRunMaintenanceAsync();
+      expect(discovery.peers.single.reachable, isFalse,
+          reason: 'unreachable after three consecutive failures (~15 s)');
+
+      // It answers again: reachable immediately, metadata refreshed.
+      client.infoByPort[47101] =
+          nodeInfo('remote', name: 'remote-renamed', apiPort: 47101);
+      clock.advance(const Duration(seconds: 5));
+      await discovery.debugRunMaintenanceAsync();
+      final back = discovery.peers.single;
+      expect(back.reachable, isTrue);
+      expect(back.name, 'remote-renamed');
+    });
+
+    test('drops an unreachable auto peer after 120 s but keeps manual peers',
+        () async {
+      final clock = FakeClock(DateTime(2025, 1, 1));
+      // Neither peer answers HTTP.
+      final discovery = await startedLiveness(clock, FakeNodeClient());
+      discovery.debugSeedPeer(nodeInfo('auto', name: 'auto'),
+          lastSeen: clock.now);
+      discovery.debugSeedPeer(nodeInfo('manual', name: 'manual'),
+          manual: true, lastSeen: clock.now);
+
+      final changes = <List<NodeInfo>>[];
+      final sub = discovery.peersChanged.listen(changes.add);
+
+      for (var i = 0; i < 3; i++) {
+        clock.advance(const Duration(seconds: 5));
+        await discovery.debugRunMaintenanceAsync();
+      }
+      expect(discovery.peers.firstWhere((p) => p.nodeId == 'auto').reachable,
+          isFalse);
+      expect(discovery.peers.firstWhere((p) => p.nodeId == 'manual').reachable,
+          isFalse);
+
+      // 15 s (unreachable) + 106 s = 121 s since the last contact.
+      clock.advance(const Duration(seconds: 106));
+      await discovery.debugRunMaintenanceAsync();
+      expect(discovery.peers.map((p) => p.nodeId), isNot(contains('auto')));
+
+      clock.advance(const Duration(minutes: 5));
+      await discovery.debugRunMaintenanceAsync();
+      expect(discovery.peers.map((p) => p.nodeId), contains('manual'));
+      await Future<void>.delayed(Duration.zero);
+      expect(changes, isNotEmpty);
+      await sub.cancel();
+    });
+
+    test('probes never overlap and stay within the concurrency bound', () async {
+      final clock = FakeClock(DateTime(2025, 1, 1));
+      final client = FakeNodeClient()..infoGate = Completer<void>();
+      for (var i = 0; i < 10; i++) {
+        client.infoByPort[47200 + i] =
+            nodeInfo('peer$i', apiPort: 47200 + i);
+      }
+      final discovery =
+          await startedLiveness(clock, client, probeConcurrency: 4);
+      for (var i = 0; i < 10; i++) {
+        discovery.debugSeedPeer(nodeInfo('peer$i', apiPort: 47200 + i),
+            lastSeen: clock.now);
+      }
+
+      clock.advance(const Duration(seconds: 5));
+      discovery.debugRunMaintenance();
+      expect(client.maxConcurrentInfoCalls, 4,
+          reason: 'bounded concurrency, one probe per peer');
+
+      // A second pass while probes are in flight must not add duplicates.
+      clock.advance(const Duration(seconds: 5));
+      discovery.debugRunMaintenance();
+      expect(client.concurrentInfoCalls, 4);
+      expect(client.maxConcurrentInfoCalls, 4);
+
+      client.infoGate!.complete();
+      await discovery.debugWaitForProbes();
+      expect(discovery.peers, hasLength(10));
+      expect(discovery.peers.every((p) => p.reachable), isTrue);
+    });
   });
 
   test('addManualPeer resolves through GET /v1/node and is never dropped',

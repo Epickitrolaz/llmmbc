@@ -51,7 +51,10 @@ void main() {
         .cast<Map<String, dynamic>>()
         .singleWhere((p) => p['nodeId'] == 'remote');
     expect(rawSelf['isSelf'], isTrue);
+    expect(rawSelf['reachable'], isTrue);
     expect(rawRemote['isSelf'], isNot(true));
+    expect(rawRemote['reachable'], isTrue,
+        reason: 'GET /v1/peers must expose observer-side liveness (§4)');
 
     final models = await service.models.list();
     expect(models.single.ref, ModelRef.parse('qwen3:0.6b'));

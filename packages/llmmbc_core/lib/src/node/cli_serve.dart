@@ -26,7 +26,11 @@ ArgParser buildServeCommandParser() => ArgParser()
       help: 'Memory the budget is based on (env LLMMBC_MEMORY_BASIS)')
   ..addOption('memory-share',
       help: 'Fraction (0..1] of that memory lent to sessions '
-          '(env LLMMBC_MEMORY_SHARE, default $kDefaultMemoryShare)');
+          '(env LLMMBC_MEMORY_SHARE, default $kDefaultMemoryShare)')
+  ..addFlag('allow-expert-streaming',
+      negatable: true,
+      help: 'MoE only: let expert weights on workers exceed their budgets and '
+          'stream from their disks (env LLMMBC_EXPERT_STREAMING=0|1)');
 
 /// Explicit overrides parsed from one `serve` invocation.
 class ServeRequest {
@@ -40,12 +44,16 @@ class ServeRequest {
   final List<String>? peers;
   final MemoryOverrides memory;
 
+  /// null when neither the flag nor `LLMMBC_EXPERT_STREAMING` was supplied.
+  final bool? allowExpertStreaming;
+
   const ServeRequest({
     this.name,
     this.workerEnabled,
     this.port,
     this.peers,
     this.memory = const MemoryOverrides(),
+    this.allowExpertStreaming,
   });
 }
 
@@ -107,11 +115,31 @@ ServeRequest serveRequestFromArgs(
     }
   }
 
+  bool? allowExpertStreaming;
+  if (command.wasParsed('allow-expert-streaming')) {
+    // `--allow-expert-streaming` / `--no-allow-expert-streaming`.
+    allowExpertStreaming = command['allow-expert-streaming'] as bool;
+  } else {
+    final raw = environment['LLMMBC_EXPERT_STREAMING'];
+    if (raw != null && raw.trim().isNotEmpty) {
+      final value = raw.trim().toLowerCase();
+      if (value == '1' || value == 'true') {
+        allowExpertStreaming = true;
+      } else if (value == '0' || value == 'false') {
+        allowExpertStreaming = false;
+      } else {
+        throw FormatException(
+            'invalid LLMMBC_EXPERT_STREAMING "$raw" (expected 0 or 1)');
+      }
+    }
+  }
+
   return ServeRequest(
     name: name,
     workerEnabled: workerEnabled,
     port: port,
     peers: peersGiven ? peers.toList() : null,
+    allowExpertStreaming: allowExpertStreaming,
     memory: parseMemoryOverrides(
       basisFlag: command.wasParsed('memory-basis')
           ? command['memory-basis'] as String?
@@ -151,6 +179,10 @@ NodeSettings applyServeRequest(NodeSettings persisted, ServeRequest request) {
   final memory = request.memory;
   if (memory.basis != null || memory.share != null) {
     next = next.copyWith(memoryBasis: memory.basis, memoryShare: memory.share);
+  }
+  final allowExpertStreaming = request.allowExpertStreaming;
+  if (allowExpertStreaming != null) {
+    next = next.copyWith(allowExpertStreaming: allowExpertStreaming);
   }
   return next;
 }
