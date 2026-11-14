@@ -21,6 +21,10 @@
 #   desktop: llama-server[.exe], rpc-server[.exe] and the shared libraries
 #   android: libllama_server.so, librpc_server.so and the shared lib*.so dependencies
 #
+# The checkout is always the pinned tag with native/patches/*.patch applied in order.
+# The patches add SET_TENSOR_FROM_FILE (workers load weights from their own GGUF) and
+# rpc-server --lazy-weights; see native/README.md.
+#
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -75,12 +79,46 @@ find_ndk() {
 
 # --- fetch sources ---------------------------------------------------------
 SRC_DIR="${LLAMA_SRC_DIR:-$REPO_ROOT/native/src/llama.cpp}"
+PATCH_DIR="$REPO_ROOT/native/patches"
 if [ ! -f "$SRC_DIR/CMakeLists.txt" ]; then
   log "cloning llama.cpp $VERSION into $SRC_DIR"
   mkdir -p "$(dirname "$SRC_DIR")"
   git clone --depth 1 --branch "$VERSION" "${LLAMA_REPO:-https://github.com/ggml-org/llama.cpp.git}" "$SRC_DIR"
 else
   log "using existing checkout $SRC_DIR"
+fi
+
+# The patches are part of the engine contract (§6.1): every build, every target.
+if [ ! -d "$SRC_DIR/.git" ]; then
+  echo "error: LLAMA_SRC_DIR=$SRC_DIR is not a git checkout; git apply is required for" >&2
+  echo "       native/patches/*.patch. Clone the pinned tag instead of passing a tarball." >&2
+  exit 1
+fi
+
+CHECKOUT_VERSION="$(git -C "$SRC_DIR" describe --tags --always 2>/dev/null || true)"
+if [ "$CHECKOUT_VERSION" != "$VERSION" ]; then
+  log "checkout is at '$CHECKOUT_VERSION', switching to pinned tag '$VERSION'"
+  git -C "$SRC_DIR" fetch --depth 1 origin "refs/tags/$VERSION:refs/tags/$VERSION"
+  git -C "$SRC_DIR" checkout --force "$VERSION"
+  # A stale patched tree would make the patches fail to apply.
+  git -C "$SRC_DIR" reset --hard "$VERSION"
+fi
+
+if [ -d "$PATCH_DIR" ]; then
+  for patch in "$PATCH_DIR"/*.patch; do
+    [ -e "$patch" ] || continue
+    name="$(basename "$patch")"
+    if git -C "$SRC_DIR" apply --reverse --check "$patch" >/dev/null 2>&1; then
+      log "patch already applied: $name"
+    elif git -C "$SRC_DIR" apply --check "$patch" >/dev/null 2>&1; then
+      log "applying patch: $name"
+      git -C "$SRC_DIR" apply "$patch"
+    else
+      echo "error: $name does not apply to $SRC_DIR ($CHECKOUT_VERSION)." >&2
+      echo "       The checkout was modified; delete it or set LLAMA_SRC_DIR to a clean clone." >&2
+      exit 1
+    fi
+  done
 fi
 
 BUILD_PARENT="$REPO_ROOT/native/src/build-$TARGET"
@@ -98,6 +136,9 @@ CMAKE_ARGS=(
   -DLLAMA_CURL=OFF
   -DGGML_RPC=ON
   -DBUILD_SHARED_LIBS=ON
+  # Keep $ORIGIN-relative RUNPATHs so the flat native/out/<target>/ directory runs
+  # after being copied (Docker image, release bundle) without LD_LIBRARY_PATH.
+  -DCMAKE_BUILD_RPATH_USE_ORIGIN=ON
 )
 
 if [ "$HOST_KIND" = "android" ]; then

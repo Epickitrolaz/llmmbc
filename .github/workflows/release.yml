@@ -151,7 +151,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: engine-out/${{ matrix.target }}
-          key: engine-${{ matrix.target }}-${{ steps.llama.outputs.value }}-${{ hashFiles('scripts/build_engine.sh', 'scripts/fetch_engine.sh') }}
+          key: engine-${{ matrix.target }}-${{ steps.llama.outputs.value }}-${{ hashFiles('scripts/build_engine.sh', 'scripts/fetch_engine.sh', 'native/patches/**') }}
       - name: Export Android NDK location
         if: startsWith(matrix.target, 'android')
         shell: bash
@@ -213,7 +213,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: engine-out/macos-arm64
-          key: engine-macos-arm64-${{ steps.llama.outputs.value }}-${{ hashFiles('scripts/build_engine.sh', 'scripts/fetch_engine.sh') }}
+          key: engine-macos-arm64-${{ steps.llama.outputs.value }}-${{ hashFiles('scripts/build_engine.sh', 'scripts/fetch_engine.sh', 'native/patches/**') }}
       - name: Fetch engine
         if: steps.cache.outputs.cache-hit != 'true'
         shell: bash

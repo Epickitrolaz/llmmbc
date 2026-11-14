@@ -193,6 +193,73 @@ void main() {
     expect(engine.logTail, isNotEmpty);
   }, skip: Platform.isWindows ? 'POSIX execute permissions' : null);
 
+  test(
+      'startRpcWorker passes --model-file/--lazy-weights and only -c with a cacheDir',
+      () async {
+    final bin = Directory('${tmp.path}/engine')..createSync();
+    final argsFile = File('${bin.path}/args.txt');
+    final script = File('${bin.path}/rpc-server')..writeAsStringSync(r'''
+#!/usr/bin/env python3
+import os, socket, sys, time
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'args.txt'), 'w') as f:
+    f.write('\n'.join(sys.argv[1:]))
+port = int(sys.argv[sys.argv.index('-p') + 1])
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('0.0.0.0', port))
+s.listen(1)
+while True:
+    time.sleep(0.5)
+''');
+    await Process.run('chmod', ['+x', script.path]);
+    final model = File('${bin.path}/model.gguf')..writeAsStringSync('GGUF');
+    final engine = LlamaCppEngine(locator: _Locator(rpc: script.path));
+    addTearDown(engine.stopRpcWorker);
+
+    final port = await _freePort();
+    expect(
+        await engine.startRpcWorker(
+            port: port, modelPath: model.path, lazyWeights: true),
+        port);
+    final args = (await argsFile.readAsString()).split('\n');
+    expect(args, containsAllInOrder(['--model-file', model.path]));
+    expect(args, contains('--lazy-weights'));
+    expect(args, isNot(contains('-c')),
+        reason: 'the legacy hash cache is off unless cacheDir is given');
+
+    await engine.stopRpcWorker();
+    await engine.startRpcWorker(
+        port: await _freePort(),
+        modelPath: model.path,
+        cacheDir: '${tmp.path}/cache');
+    final cached = (await argsFile.readAsString()).split('\n');
+    expect(cached, contains('-c'));
+    expect(cached, isNot(contains('--lazy-weights')));
+    expect(cached, containsAllInOrder(['--model-file', model.path]));
+  }, skip: Platform.isWindows ? 'POSIX shell script' : null);
+
+  test('lazy weights require a local model path', () async {
+    final bin = Directory('${tmp.path}/engine')..createSync();
+    final exe = File('${bin.path}/rpc-server')
+      ..writeAsStringSync('#!/bin/sh\nexit 0\n');
+    await Process.run('chmod', ['+x', exe.path]);
+    final engine = LlamaCppEngine(locator: _Locator(rpc: exe.path));
+    await expectLater(
+      engine.startRpcWorker(port: await _freePort(), lazyWeights: true),
+      throwsA(isA<LlmmbcException>()
+          .having((e) => e.code, 'code', 'engine_error')
+          .having((e) => e.message, 'message', contains('--model-file'))),
+    );
+    await expectLater(
+      engine.startRpcWorker(
+          port: await _freePort(), modelPath: '${bin.path}/missing.gguf'),
+      throwsA(isA<LlmmbcException>()
+          .having((e) => e.code, 'code', 'engine_error')
+          .having(
+              (e) => e.message, 'message', contains('model file not found'))),
+    );
+  }, skip: Platform.isWindows ? 'POSIX execute permissions' : null);
+
   test('supervisor shell resolves to the Android platform shell', () {
     expect(supervisorShell(android: true), '/system/bin/sh');
     expect(supervisorShell(android: false), '/bin/sh');

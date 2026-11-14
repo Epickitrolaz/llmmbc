@@ -8,6 +8,7 @@ import 'package:llmmbc_core/llmmbc_core.dart';
 import 'package:test/test.dart';
 
 const int _gib = 1024 * 1024 * 1024;
+const int _mib = 1024 * 1024;
 final bool _enabled = Platform.environment['LLMMBC_ENGINE_IT'] == '1';
 final String _cacheDir = Platform.environment['LLMMBC_IT_MODEL_DIR'] ??
     '${Directory.systemTemp.path}/llmmbc-engine-it';
@@ -26,6 +27,8 @@ class _ModelSpec {
   final String digest;
   final int sizeBytes;
   final GgufMetadata metadata;
+
+  String get cacheName => 'sha256-$digest.gguf';
 }
 
 final _specs = [
@@ -63,101 +66,289 @@ final _specs = [
 
 void main() {
   group('llama.cpp engine integration', () {
-    for (final spec in _specs) {
-      test(spec.name, () async {
-        final locator = DefaultEngineLocator();
-        expect(await locator.available, isTrue,
-            reason:
-                'engine binaries missing - run scripts/fetch_engine.sh linux-x64');
-
-        final modelFile = await _ensureModel(spec);
-        final model = LocalModel(
-          ref: spec.ref,
-          ggufPath: modelFile.path,
-          sizeBytes: spec.sizeBytes,
-          metadata: spec.metadata,
-        );
-
-        final rpcPorts = [await _freePort(), await _freePort()];
-        final coordinatorPort = await _freePort();
-        final workerEngines = [
-          LlamaCppEngine(locator: locator),
-          LlamaCppEngine(locator: locator),
-        ];
-        final coordinatorEngine = LlamaCppEngine(locator: locator);
-        addTearDown(() async {
-          await coordinatorEngine.stopCoordinator();
-          for (final engine in workerEngines) {
-            await engine.stopRpcWorker();
-          }
-        });
-
-        final cache = Directory('$_cacheDir/rpc-cache-${spec.ref.name}')
-          ..createSync(recursive: true);
-        for (var i = 0; i < workerEngines.length; i++) {
-          final port = await workerEngines[i].startRpcWorker(
-            port: rpcPorts[i],
-            cacheDir: '${cache.path}/$i',
-          );
-          expect(port, rpcPorts[i]);
+    test('dense: workers load weights from their own GGUF copy', () async {
+      final spec = _specs[0];
+      final model = await _prepareModel(spec);
+      final workers = await _startWorkers(spec, lazy: const [true, true]);
+      addTearDown(() async {
+        for (final worker in workers) {
+          await worker.engine.stopRpcWorker();
         }
+      });
+      final coordinatorEngine = LlamaCppEngine(locator: DefaultEngineLocator());
+      addTearDown(coordinatorEngine.stopCoordinator);
 
-        const planner = DefaultClusterPlanner();
-        final plan = planner.plan(model, [
-          PlanNode(
-              nodeId: 'coordinator', rpcEndpoint: null, budgetBytes: 6 * _gib),
-          PlanNode(
-              nodeId: 'worker-1',
-              rpcEndpoint: '127.0.0.1:${rpcPorts[0]}',
-              budgetBytes: 4 * _gib),
-          PlanNode(
-              nodeId: 'worker-2',
-              rpcEndpoint: '127.0.0.1:${rpcPorts[1]}',
-              budgetBytes: 4 * _gib),
-        ]);
-        if (spec.metadata.isMoe) {
-          expect(plan.tensorOverrides, isNotEmpty,
-              reason: 'MoE plan must emit expert overrides');
+      const planner = DefaultClusterPlanner();
+      final plan = planner.plan(model, [
+        PlanNode(
+            nodeId: 'coordinator', rpcEndpoint: null, budgetBytes: 6 * _gib),
+        PlanNode(
+            nodeId: 'worker-1',
+            rpcEndpoint: '127.0.0.1:${workers[0].port}',
+            budgetBytes: 4 * _gib),
+        PlanNode(
+            nodeId: 'worker-2',
+            rpcEndpoint: '127.0.0.1:${workers[1].port}',
+            budgetBytes: 4 * _gib),
+      ]);
+
+      final uri = await coordinatorEngine.startCoordinator(
+        model: model,
+        plan: plan,
+        port: await _freePort(),
+      );
+      final answer = await _chat(uri, spec.ref.toString());
+      expect(answer.trim(), isNotEmpty);
+
+      // Stopping the coordinator closes the RPC connections, which makes each
+      // rpc-server log its exact transfer totals.
+      await coordinatorEngine.stopCoordinator();
+      final stats = [
+        for (final worker in workers) await _waitRpcStats(worker.engine),
+      ];
+
+      final placement = _Placement.parse(coordinatorEngine.logTail);
+      // ignore: avoid_print
+      print('${spec.name}: answer="${answer.trim()}"');
+      for (var i = 0; i < workers.length; i++) {
+        final assigned = _weightsAssigned(plan, 'worker-${i + 1}');
+        final s = stats[i];
+        // ignore: avoid_print
+        print('${spec.name}: worker-${i + 1} loaded=${workers[i].modelPath} '
+            'planned_node_bytes=${_fmt(assigned)} from_file=${_fmt(s.fromFileBytes)} '
+            '(${s.fromFileTensors} tensors) over_socket=${_fmt(s.socketBytes)}');
+        expect(s.fromFileBytes, greaterThan(0),
+            reason: 'worker-${i + 1} must load weights from its own file');
+        expect(s.fromFileBytes, greaterThan((spec.sizeBytes * 0.1).round()),
+            reason: 'the assigned weight shard is loaded from disk');
+        expect(s.socketBytes, lessThan(spec.sizeBytes ~/ 20),
+            reason: 'weights must not cross the socket ('
+                '${s.socketBytes} bytes of ${spec.sizeBytes})');
+        expect(workers[i].engine.logTail.join('\n'),
+            contains('model file: ${workers[i].modelPath}'));
+        expect(
+            workers[i].engine.logTail.join('\n'), contains('lazy weights: on'));
+      }
+      _assertPlacement(plan, spec, placement);
+    }, timeout: Timeout(const Duration(minutes: 15)));
+
+    test('MoE expert streaming: mapped weights, low RSS, experts paged in',
+        () async {
+      final spec = _specs[1];
+      final model = await _prepareModel(spec);
+      final workers = await _startWorkers(spec, lazy: const [true, true]);
+      addTearDown(() async {
+        for (final worker in workers) {
+          await worker.engine.stopRpcWorker();
         }
+      });
+      final coordinatorEngine = LlamaCppEngine(locator: DefaultEngineLocator());
+      addTearDown(coordinatorEngine.stopCoordinator);
 
-        final uri = await coordinatorEngine.startCoordinator(
-          model: model,
-          plan: plan,
-          port: coordinatorPort,
-        );
-        final answer = await _chat(uri, spec.ref.toString());
+      // Attention + KV (~755 MiB) fits the coordinator; the cluster total
+      // (~1.07 GiB) is below the 1.42 GiB model, so only expert streaming fits.
+      // Each worker is planned 3 of the 24 expert layers (142 MiB), which is
+      // more than its own 132 MiB budget.
+      final nodes = [
+        PlanNode(
+            nodeId: 'coordinator', rpcEndpoint: null, budgetBytes: 780 * _mib),
+        PlanNode(
+            nodeId: 'worker-1',
+            rpcEndpoint: '127.0.0.1:${workers[0].port}',
+            budgetBytes: 132 * _mib),
+        PlanNode(
+            nodeId: 'worker-2',
+            rpcEndpoint: '127.0.0.1:${workers[1].port}',
+            budgetBytes: 132 * _mib),
+      ];
+      const planner = DefaultClusterPlanner();
+      expect(
+        () => planner.plan(model, nodes),
+        throwsA(isA<PlanError>()),
+        reason: 'without streaming the MoE weights do not fit these budgets',
+      );
+      final plan = planner.plan(model, nodes, allowExpertStreaming: true);
+      expect(plan.tensorOverrides, isNotEmpty);
 
-        final args = planner.llamaServerArgsForModel(plan, model);
-        final splitIndex = args.indexOf('--tensor-split');
-        final tail = coordinatorEngine.logTail;
-        final placement = _Placement.parse(tail);
-        // ignore: avoid_print
-        print(
-            '${spec.name}: split=${splitIndex < 0 ? 'none' : args[splitIndex + 1]} '
-            'ngl=${args[args.indexOf('-ngl') + 1]} overrides=${plan.tensorOverrides.length}');
-        // ignore: avoid_print
-        print(
-            '${spec.name}: placement model=${placement.model} kv=${placement.kv}');
-        // ignore: avoid_print
-        print('${spec.name}: answer="${answer.trim()}"');
+      final uri = await coordinatorEngine.startCoordinator(
+        model: model,
+        plan: plan,
+        port: await _freePort(),
+      );
 
-        expect(answer.trim(), isNotEmpty);
-        // #32: the log ring must retain loader/placement diagnostics.
-        expect(tail.join('\n'), contains('model buffer size'));
-        expect(tail.join('\n'), contains('KV buffer size'));
-        _assertPlacement(plan, spec, placement);
-      }, timeout: Timeout(const Duration(minutes: 15)));
-    }
+      // Model loaded, no prompt yet: expert pages must mostly still be on disk.
+      final rssBefore = <int>[];
+      for (final worker in workers) {
+        rssBefore.add(await _rpcServerRss(worker.engine));
+      }
+      final answer = await _chat(uri, spec.ref.toString());
+      expect(answer.trim(), isNotEmpty);
+      final rssAfter = <int>[];
+      for (final worker in workers) {
+        rssAfter.add(await _rpcServerRss(worker.engine));
+      }
+
+      await coordinatorEngine.stopCoordinator();
+      final stats = [
+        for (final worker in workers) await _waitRpcStats(worker.engine),
+      ];
+      final placement = _Placement.parse(coordinatorEngine.logTail);
+
+      // ignore: avoid_print
+      print('${spec.name}: answer="${answer.trim()}" '
+          'budgets=780/132/132 MiB streaming=true');
+      for (var i = 0; i < workers.length; i++) {
+        final nodeId = 'worker-${i + 1}';
+        final assigned = _weightsAssigned(plan, nodeId);
+        final budget = nodes[i + 1].budgetBytes;
+        final s = stats[i];
+        // ignore: avoid_print
+        print('${spec.name}: $nodeId planned_node_bytes=${_fmt(assigned)} '
+            '(budget=${_fmt(budget)}) from_file=${_fmt(s.fromFileBytes)} '
+            'over_socket=${_fmt(s.socketBytes)} '
+            'rss_before=${_fmt(rssBefore[i])} rss_after=${_fmt(rssAfter[i])} '
+            'rss_delta=${_fmt(rssAfter[i] - rssBefore[i])}');
+        expect(assigned, greaterThan(budget),
+            reason: '$nodeId should hold more expert bytes than its budget');
+        expect(s.fromFileBytes, greaterThan(0));
+        expect(s.fromFileBytes, greaterThan((assigned * 0.5).round()));
+        expect(s.socketBytes, lessThan(spec.sizeBytes ~/ 20));
+        expect(rssBefore[i], lessThan(assigned ~/ 2),
+            reason: 'mapped weights must not be resident after load');
+        expect(rssAfter[i], greaterThan(rssBefore[i]),
+            reason: 'expert pages are paged in by the prompt');
+      }
+      _assertPlacement(plan, spec, placement);
+    }, timeout: Timeout(const Duration(minutes: 15)));
+
+    test('fallback: a worker without --model-file still receives bytes',
+        () async {
+      final spec = _specs[0];
+      final model = await _prepareModel(spec);
+      // Worker 0 forces the pread-into-buffer path (--model-file without
+      // --lazy-weights); worker 1 behaves like an old rpc-server: it does not
+      // advertise SET_TENSOR_FROM_FILE and receives the bytes.
+      final workers = await _startWorkers(spec,
+          lazy: const [false, false], modelFile: const [true, false]);
+      addTearDown(() async {
+        for (final worker in workers) {
+          await worker.engine.stopRpcWorker();
+        }
+      });
+      final coordinatorEngine = LlamaCppEngine(locator: DefaultEngineLocator());
+      addTearDown(coordinatorEngine.stopCoordinator);
+
+      const planner = DefaultClusterPlanner();
+      final plan = planner.plan(model, [
+        PlanNode(
+            nodeId: 'coordinator', rpcEndpoint: null, budgetBytes: 6 * _gib),
+        PlanNode(
+            nodeId: 'worker-1',
+            rpcEndpoint: '127.0.0.1:${workers[0].port}',
+            budgetBytes: 4 * _gib),
+        PlanNode(
+            nodeId: 'worker-2',
+            rpcEndpoint: '127.0.0.1:${workers[1].port}',
+            budgetBytes: 4 * _gib),
+      ]);
+      final uri = await coordinatorEngine.startCoordinator(
+        model: model,
+        plan: plan,
+        port: await _freePort(),
+      );
+      final answer = await _chat(uri, spec.ref.toString());
+      expect(answer.trim(), isNotEmpty);
+
+      await coordinatorEngine.stopCoordinator();
+      final stats = [
+        for (final worker in workers) await _waitRpcStats(worker.engine),
+      ];
+      final fromFile = stats[0];
+      final overSocket = stats[1];
+      final assigned = _weightsAssigned(plan, 'worker-2');
+      // ignore: avoid_print
+      print('${spec.name}: fallback worker (no --model-file) '
+          'planned_node_bytes=${_fmt(assigned)} '
+          'from_file=${_fmt(overSocket.fromFileBytes)} '
+          'over_socket=${_fmt(overSocket.socketBytes)}');
+      expect(fromFile.fromFileBytes, greaterThan(0));
+      expect(fromFile.socketBytes, lessThan(spec.sizeBytes ~/ 20));
+      expect(overSocket.fromFileBytes, 0,
+          reason: 'old servers have no SET_TENSOR_FROM_FILE');
+      expect(
+          overSocket.socketBytes, greaterThan((spec.sizeBytes * 0.2).round()),
+          reason: 'the fallback path sends the weights over the socket');
+      expect(workers[1].engine.logTail.join('\n'),
+          isNot(contains('model file: ')));
+      _assertPlacement(plan, spec, _Placement.parse(coordinatorEngine.logTail));
+    }, timeout: Timeout(const Duration(minutes: 15)));
   },
       skip: _enabled
           ? false
           : 'set LLMMBC_ENGINE_IT=1 to run the llama.cpp integration test');
 }
 
+class _Worker {
+  _Worker(this.engine, this.port, this.modelPath);
+  final LlamaCppEngine engine;
+  final int port;
+  final String? modelPath;
+}
+
+Future<LocalModel> _prepareModel(_ModelSpec spec) async {
+  final file = await _ensureModel(spec);
+  return LocalModel(
+    ref: spec.ref,
+    ggufPath: file.path,
+    sizeBytes: spec.sizeBytes,
+    metadata: spec.metadata,
+  );
+}
+
+/// Starts two local rpc-servers. Each gets its **own copy** of the GGUF at a
+/// separate path (architecture §2.2: every candidate already has the model).
+Future<List<_Worker>> _startWorkers(_ModelSpec spec,
+    {required List<bool> lazy,
+    List<bool> modelFile = const [true, true]}) async {
+  final locator = DefaultEngineLocator();
+  expect(await locator.available, isTrue,
+      reason:
+          'engine binaries missing - run scripts/fetch_engine.sh linux-x64');
+  final workers = <_Worker>[];
+  for (var i = 0; i < 2; i++) {
+    final engine = LlamaCppEngine(locator: locator);
+    final path = modelFile[i] ? await _workerModelCopy(spec, i) : null;
+    final port = await engine.startRpcWorker(
+      port: await _freePort(),
+      modelPath: path,
+      lazyWeights: lazy[i] && path != null,
+    );
+    workers.add(_Worker(engine, port, path));
+  }
+  return workers;
+}
+
+/// A real per-worker copy (not a link): `rpc-server --model-file` must point at
+/// a path that only this worker owns.
+Future<String> _workerModelCopy(_ModelSpec spec, int index) async {
+  final source = await _ensureModel(spec);
+  final dir = Directory('$_cacheDir/workers/${spec.digest.substring(0, 12)}');
+  await dir.create(recursive: true);
+  final target = File('${dir.path}/worker-$index.gguf');
+  if (await target.exists() && await target.length() == spec.sizeBytes) {
+    return target.path;
+  }
+  final partial = File('${target.path}.copy');
+  if (await partial.exists()) await partial.delete();
+  await source.copy(partial.path);
+  await partial.rename(target.path);
+  return target.path;
+}
+
 Future<File> _ensureModel(_ModelSpec spec) async {
   final dir = Directory(_cacheDir);
   await dir.create(recursive: true);
-  final target = File('${dir.path}/sha256-${spec.digest}.gguf');
+  final target = File('${dir.path}/${spec.cacheName}');
   if (await target.exists() && await target.length() == spec.sizeBytes) {
     return target;
   }
@@ -192,6 +383,59 @@ Future<File> _ensureModel(_ModelSpec spec) async {
     client.close();
   }
 }
+
+/// Transfer counters logged by the patched rpc-server. The last line (logged
+/// when the coordinator disconnects) carries the exact totals.
+class _RpcStats {
+  const _RpcStats(this.fromFileBytes, this.fromFileTensors, this.socketBytes);
+  final int fromFileBytes;
+  final int fromFileTensors;
+  final int socketBytes;
+
+  static final _line = RegExp(
+      r'from_file_bytes=(\d+) from_file_tensors=(\d+) socket_bytes=(\d+)');
+
+  static _RpcStats? parse(List<String> lines) {
+    _RpcStats? best;
+    for (final line in lines) {
+      final match = _line.firstMatch(line);
+      if (match == null) continue;
+      final stats = _RpcStats(int.parse(match.group(1)!),
+          int.parse(match.group(2)!), int.parse(match.group(3)!));
+      if (best == null ||
+          stats.fromFileBytes > best.fromFileBytes ||
+          stats.socketBytes > best.socketBytes) {
+        best = stats;
+      }
+    }
+    return best;
+  }
+}
+
+Future<_RpcStats> _waitRpcStats(LlamaCppEngine engine) async {
+  final deadline = DateTime.now().add(const Duration(seconds: 20));
+  // Only the destructor line (`~rpc_server`) has the exact totals; the periodic
+  // 16 MiB lines are partial.
+  bool isFinal(String line) =>
+      line.contains('~rpc_server] totals:') && _RpcStats._line.hasMatch(line);
+  while (DateTime.now().isBefore(deadline)) {
+    if (engine.logTail.any(isFinal)) {
+      return _RpcStats.parse(engine.logTail)!;
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+  }
+  final fallback = _RpcStats.parse(engine.logTail);
+  if (fallback == null) {
+    throw StateError('rpc-server logged no transfer stats:\n'
+        '${engine.logTail.join('\n')}');
+  }
+  return fallback;
+}
+
+/// The plan's estimate for a node: assigned weights plus the planner's 10%
+/// overhead (and KV when the node runs attention layers).
+int _weightsAssigned(ClusterPlan plan, String nodeId) =>
+    plan.assignments.firstWhere((a) => a.nodeId == nodeId).estimatedBytes;
 
 Future<String> _chat(Uri base, String model) async {
   final client = http.Client();
@@ -229,6 +473,41 @@ Future<String> _chat(Uri base, String model) async {
   } finally {
     client.close();
   }
+}
+
+/// Resident set size of the rpc-server child of [engine]'s supervisor.
+Future<int> _rpcServerRss(LlamaCppEngine engine) async {
+  final supervisor = engine.rpcWorkerPid;
+  if (supervisor == null) throw StateError('rpc-server is not running');
+  final deadline = DateTime.now().add(const Duration(seconds: 10));
+  while (DateTime.now().isBefore(deadline)) {
+    final childrenFile = File('/proc/$supervisor/task/$supervisor/children');
+    if (await childrenFile.exists()) {
+      final children = (await childrenFile.readAsString()).trim();
+      // The supervisor forks both rpc-server and a watchdog subshell; pick the
+      // engine by its comm name instead of relying on child order.
+      for (final field in children.split(RegExp(r'\s+'))) {
+        final pid = int.tryParse(field);
+        if (pid == null) continue;
+        final comm = File('/proc/$pid/comm');
+        if (!await comm.exists() ||
+            !(await comm.readAsString()).trim().contains('rpc-server')) {
+          continue;
+        }
+        final status = File('/proc/$pid/status');
+        if (await status.exists()) {
+          for (final line in await status.readAsLines()) {
+            if (line.startsWith('VmRSS:')) {
+              final kb = int.parse(RegExp(r'\d+').firstMatch(line)!.group(0)!);
+              return kb * 1024;
+            }
+          }
+        }
+      }
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+  }
+  throw StateError('could not read rpc-server RSS for supervisor $supervisor');
 }
 
 void _assertPlacement(ClusterPlan plan, _ModelSpec spec, _Placement actual) {
@@ -333,4 +612,10 @@ Future<int> _freePort() async {
   final port = socket.port;
   await socket.close();
   return port;
+}
+
+String _fmt(int bytes) {
+  if (bytes >= _gib) return '${(bytes / _gib).toStringAsFixed(2)} GiB';
+  if (bytes >= _mib) return '${(bytes / _mib).toStringAsFixed(1)} MiB';
+  return '$bytes B';
 }

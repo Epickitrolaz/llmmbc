@@ -53,9 +53,16 @@ class LlamaCppEngine implements InferenceEngine {
       throw LlmmbcException('engine_error',
           'rpc-server binary not found (engine location unavailable)');
     }
-    // TEMPORARY (contract 2026-11-14): engine stream replaces this with the
-    // load-from-file flags (§6.1); until then keep the legacy hash cache.
+    // §6.1: the worker loads weight tensors from its own GGUF copy. `-c` (the legacy
+    // hash cache that stores a second copy on disk) is only enabled when a cacheDir is given.
     if (cacheDir != null) await Directory(cacheDir).create(recursive: true);
+    if (modelPath != null && !await File(modelPath).exists()) {
+      throw LlmmbcException('engine_error', 'model file not found: $modelPath');
+    }
+    if (lazyWeights && modelPath == null) {
+      throw LlmmbcException('engine_error',
+          '--lazy-weights requires a modelPath (rpc-server --model-file)');
+    }
 
     final candidates = await _rpcPortCandidates(port);
     if (candidates.isEmpty) {
@@ -72,7 +79,15 @@ class LlamaCppEngine implements InferenceEngine {
       _rpcExited = false;
       final process = await _start(
         exe,
-        ['-H', '0.0.0.0', '-p', '$candidate', if (cacheDir != null) '-c'],
+        [
+          '-H',
+          '0.0.0.0',
+          '-p',
+          '$candidate',
+          if (modelPath != null) ...['--model-file', modelPath],
+          if (lazyWeights) '--lazy-weights',
+          if (cacheDir != null) '-c',
+        ],
         env,
         'rpc-server',
       );
@@ -154,6 +169,13 @@ class LlamaCppEngine implements InferenceEngine {
 
   @override
   bool get rpcWorkerRunning => _rpcProcess != null && !_rpcExited;
+
+  /// PID of the supervisor process for diagnostics (`/proc/<pid>/task/<pid>/children`
+  /// lists the actual rpc-server). Not part of the [InferenceEngine] contract.
+  int? get rpcWorkerPid => _rpcProcess?.pid;
+
+  /// PID of the supervisor process running llama-server (not part of the interface).
+  int? get coordinatorPid => _coordinatorProcess?.pid;
 
   @override
   Future<Uri> startCoordinator(

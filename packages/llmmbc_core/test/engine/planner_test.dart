@@ -241,6 +241,86 @@ void main() {
       );
     });
 
+    test('expert streaming lets expert shards exceed the worker budget', () {
+      // non-expert + KV ~= 2.6 GiB, so a 3 GiB cluster can host attention but
+      // not the 8 GiB of experts.
+      final meta = GgufMetadata(
+        architecture: 'qwen3moe',
+        blockCount: 24,
+        expertCount: 64,
+        expertUsedCount: 8,
+        embeddingLength: 1024,
+        contextLength: 4096,
+        totalTensorBytes: 10 * _gib,
+        expertTensorBytes: 8 * _gib,
+      );
+      final m = model(meta);
+      final nodes = [
+        coordinator(2 * _gib),
+        worker('w1', 512 * _mib),
+        worker('w2', 512 * _mib, host: '10.0.0.3', port: 50053),
+      ];
+
+      expect(
+          () => planner.plan(m, nodes),
+          throwsA(isA<PlanError>()
+              .having((e) => e.message, 'message', contains('does not fit'))));
+
+      final plan = planner.plan(m, nodes, allowExpertStreaming: true);
+      expect(plan.nodes, hasLength(3));
+      expect(plan.assignments.fold<double>(0, (a, x) => a + x.layerFraction),
+          closeTo(1.0, 1e-9),
+          reason: 'all attention layers and KV still have to be placed');
+
+      final ranges = _parseRanges(plan.tensorOverrides);
+      expect(_allLayers(ranges), List.generate(24, (i) => i),
+          reason: 'all expert layers are covered exactly once');
+
+      // Every worker holds more expert bytes than its own budget.
+      for (final node in plan.nodes.where((n) => !n.isCoordinator)) {
+        final assignment =
+            plan.assignments.firstWhere((a) => a.nodeId == node.nodeId);
+        expect(assignment.estimatedBytes, greaterThan(node.budgetBytes),
+            reason:
+                'worker ${node.nodeId} should stream experts past its budget');
+      }
+      // No cluster-wide fit requirement remains: the plan succeeds even though
+      // the weights are larger than the sum of every budget.
+      expect(10 * _gib, greaterThan(3 * _gib));
+    });
+
+    test('expert streaming spreads expert layers proportionally to budget', () {
+      final m = model(moeMeta());
+      final plan = planner.plan(
+        m,
+        [
+          coordinator(16 * _gib),
+          worker('w1', 4 * _gib),
+          worker('w2', 8 * _gib, host: '10.0.0.3', port: 50053),
+        ],
+        allowExpertStreaming: true,
+      );
+      // 48 expert layers over the two workers (4 and 8 GiB): 16 and 32.
+      final ranges = _parseRanges(plan.tensorOverrides);
+      final byDevice = {
+        for (final r in ranges) r.device: r.layers.length,
+      };
+      expect(byDevice, isNot(contains('CPU')),
+          reason: 'streamed experts live on workers only');
+      expect(byDevice['RPC0[10.0.0.2:50052]'], 16);
+      expect(byDevice['RPC0[10.0.0.3:50053]'], 32);
+      expect(_allLayers(ranges), List.generate(48, (i) => i));
+    });
+
+    test('expert streaming does not relax dense plans', () {
+      expect(
+        () => planner.plan(model(denseMeta()), [coordinator(300 * _mib)],
+            allowExpertStreaming: true),
+        throwsA(isA<PlanError>()
+            .having((e) => e.message, 'message', contains('does not fit'))),
+      );
+    });
+
     test('invalid plans are rejected', () {
       final m = model(moeMeta());
       expect(() => planner.plan(m, const []), throwsA(isA<PlanError>()));

@@ -8,7 +8,9 @@ LLMMBC does not require an Ollama install: it runs two llama.cpp executables per
 | `rpc-server` | ggml RPC backend, one per worker (`ggml-rpc-server` upstream) |
 
 The pinned upstream tag lives in [`LLAMA_CPP_VERSION`](LLAMA_CPP_VERSION) (`b12360` at the time of
-writing; it builds with `-DGGML_RPC=ON` and still ships all desktop/server release archives).
+writing). Every target is built **from source** with the patches in [`patches/`](patches) applied:
+upstream release archives lack the load-weights-from-file support in §6.1 of the architecture
+contract.
 
 ## Fetch or build
 
@@ -20,9 +22,10 @@ scripts/build_engine.sh <target> [outdir]
 Targets: `linux-x64`, `linux-arm64`, `windows-x64`, `macos-arm64`, `macos-x64`,
 `android-arm64`, `android-x64`. Default outdir: `native/out/<target>/`.
 
-`fetch_engine.sh` downloads the official prebuilt archive when it contains both
-`llama-server` and an RPC server, renames upstream's `ggml-rpc-server` to `rpc-server`, and
-falls back to `build_engine.sh` otherwise (`android-x64` has no official archive).
+`fetch_engine.sh` always calls `build_engine.sh`; it never downloads upstream binaries.
+`build_engine.sh` clones the pinned tag into `native/src/llama.cpp` (or reuses `LLAMA_SRC_DIR`),
+switches an existing checkout back to the pinned tag, then applies `native/patches/*.patch` in
+order. Re-running a build is idempotent: already-applied patches are detected and skipped.
 
 Output layout is flat so a single directory can be shipped next to the app or mounted into a
 container:
@@ -36,6 +39,51 @@ Android binaries are renamed to `lib*.so` (executables are still ELF PIE executa
 Flutter app can package them in `android/app/src/main/jniLibs/<abi>/`; `DefaultEngineLocator`
 looks them up through `PlatformHooks.nativeLibraryDir`.
 
+## Patch: load weights from the worker's own disk (`patches/0001-rpc-load-weights-from-file.patch`)
+
+Implements [`docs/ARCHITECTURE.md` §6.1](../docs/ARCHITECTURE.md). Four files, ~440 lines:
+
+* `ggml/include/ggml-rpc.h` — protocol `10.0.0 → 10.0.1` (patch version only: the new command is
+  flag-gated, so old coordinators can still use a new rpc-server and vice versa); new
+  `ggml_backend_rpc_set_tensor_from_file(tensor, offset, file_offset, size)` (also exported through
+  the backend registry proc-address table) and `model_file`/`lazy_weights` parameters for
+  `ggml_backend_rpc_start_server`.
+* `ggml/src/ggml-rpc/ggml-rpc.cpp` — new `SET_TENSOR_FROM_FILE` command (appended, so existing
+  command numbers are unchanged) advertised through a new HELLO flag. The server:
+  * opens `--model-file` once and bounds-checks every `{offset, file_offset, size}` request against
+    both the tensor and the file;
+  * reads regions with `pread` in 16 MiB chunks (no full-tensor heap copy), and on Windows falls
+    back to seek+read;
+  * with `--lazy-weights` on POSIX, maps the GGUF once (`MAP_PRIVATE`, file opened `O_RDONLY`, so
+    writes are copy-on-write and never reach the file) and points each loaded CPU-buffer weight
+    tensor at the mapping. A per-server remap table translates the client-visible buffer address
+    range to the mapped pointer inside `deserialize_tensor`, which covers graph compute,
+    `get_tensor`, `set_tensor`, `memset_tensor` and `copy_tensor`. Deserialization never remaps a
+    tensor twice, so writes into a mapped region are COW and never reach the GGUF;
+  * allocates CPU buffers with `mmap(MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE)` so a buffer larger
+    than RAM is accepted and untouched ranges cost no RSS. The RPC protocol does not carry buffer
+    usage, so this applies to every CPU buffer the server hands out; compute buffers are small and
+    fully touched. GPU buffers and Windows keep the copying path.
+* `tools/rpc/rpc-server.cpp` — `-m/--model-file FILE` and `--lazy-weights` (requires
+  `--model-file`; POSIX only), validated before the server starts.
+* `src/llama-model-loader.cpp` — for weight tensors in an RPC buffer whose server advertises the
+  flag, calls the new API with the tensor's GGUF data offset (`weight->offs`) instead of
+  `ggml_backend_tensor_set` with the bytes. The check runs before the coordinator's mmap pointer
+  is computed, so remote weight pages are never touched on the coordinator. Unpatched servers,
+  servers without `--model-file`, GPU buffers and split GGUFs keep the old byte path.
+
+Server log lines used by the integration test (one every 16 MiB, plus exact totals on disconnect).
+`from_file_bytes` counts bytes served from the file (mapped or pread); `socket_bytes` is what
+actually crossed the network and is the number that must stay far below the model size:
+
+```
+[rpc_server] SET_TENSOR_FROM_FILE: blk.0.ffn_gate_exps.weight, totals: from_file_bytes=... from_file_tensors=... socket_bytes=...
+[rpc_server] totals: from_file_bytes=... from_file_tensors=... socket_bytes=...
+```
+
+The Dart side passes the flags from `LlamaCppEngine.startRpcWorker(modelPath:, lazyWeights:)`; the
+legacy hash cache (`-c`) is only enabled when `cacheDir` is given.
+
 ## Environment
 
 | Variable | Used by | Meaning |
@@ -44,10 +92,9 @@ looks them up through `PlatformHooks.nativeLibraryDir`.
 | `JOBS` | both | Build parallelism (default 4; keep low on shared CI hosts) |
 | `ANDROID_NDK_HOME` | android builds | NDK root; auto-detected from `ANDROID_SDK_ROOT/ndk/<newest>`, `ANDROID_HOME/ndk/<newest>`, `/root/android-sdk/ndk/<newest>` |
 | `ANDROID_SDK_ROOT` / `ANDROID_HOME` | android builds | Used to find the NDK when `ANDROID_NDK_HOME` is unset |
-| `LLAMA_SRC_DIR` | builds | Reuse an existing llama.cpp checkout |
+| `LLAMA_SRC_DIR` | builds | Reuse an existing llama.cpp checkout (must be a git checkout at the pinned tag) |
 | `LLAMA_REPO` | builds | Git URL (default `https://github.com/ggml-org/llama.cpp.git`) |
 | `CMAKE_EXTRA_ARGS` | builds | Extra CMake configure arguments (cross toolchain, Vulkan, ...) |
-| `LLAMA_RELEASE_BASE` | fetch | Release download base (GitHub by default) |
 | `LLMMBC_ENGINE_DIR` | runtime | First engine location checked by `DefaultEngineLocator` |
 
 Android requirements: Node 27+ / NDK `27.2.12479018` is what CI and this repository use:
@@ -98,6 +145,8 @@ engine never pins the Dart VM's event loop. Windows has no portable parent-death
 ## llama.cpp b12360 details
 
 * Upstream renamed `rpc-server` to `ggml-rpc-server`; both scripts normalize the name.
+* The patch adds `rpc-server --model-file` and `--lazy-weights`. On Windows the flags are accepted
+  but `--lazy-weights` degrades to reading from the file (no `MAP_NORESERVE`/mmap path).
 * `--override-tensor` buffer types are `CPU` and `RPC<device>[host:port]` (for example
   `RPC0[192.168.1.10:47102]`), **not** the older `RPC[host:port]` spelling. The planner emits the
   working `RPC0[...]` form; see the comment in `lib/src/engine/planner.dart`.
@@ -118,7 +167,7 @@ engine never pins the Dart VM's event loop. Windows has no portable parent-death
 ```bash
 scripts/fetch_engine.sh linux-x64
 native/out/linux-x64/llama-server --version
-native/out/linux-x64/rpc-server --help
+native/out/linux-x64/rpc-server --help   # includes --model-file / --lazy-weights
 ```
 
 Integration test (downloads qwen3:0.6b and granite3.1-moe:1b GGUFs from `registry.ollama.ai`
