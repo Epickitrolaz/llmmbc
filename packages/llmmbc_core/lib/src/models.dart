@@ -313,6 +313,10 @@ class NodeSettings {
   final double memoryShare;
   final MemoryBasis memoryBasis;
 
+  /// MoE only (§2.4): when this node coordinates, let expert weights on workers exceed their
+  /// memory budgets and stream from the workers' disks. Slower, runs bigger models.
+  final bool allowExpertStreaming;
+
   const NodeSettings({
     required this.nodeId,
     required this.name,
@@ -323,6 +327,7 @@ class NodeSettings {
     this.manualPeers = const [],
     this.memoryShare = kDefaultMemoryShare,
     this.memoryBasis = MemoryBasis.total,
+    this.allowExpertStreaming = false,
   });
 
   NodeSettings copyWith({
@@ -334,6 +339,7 @@ class NodeSettings {
     List<String>? manualPeers,
     double? memoryShare,
     MemoryBasis? memoryBasis,
+    bool? allowExpertStreaming,
   }) =>
       NodeSettings(
         nodeId: nodeId,
@@ -345,6 +351,7 @@ class NodeSettings {
         manualPeers: manualPeers ?? this.manualPeers,
         memoryShare: memoryShare ?? this.memoryShare,
         memoryBasis: memoryBasis ?? this.memoryBasis,
+        allowExpertStreaming: allowExpertStreaming ?? this.allowExpertStreaming,
       );
 
   Map<String, dynamic> toJson() => {
@@ -358,6 +365,7 @@ class NodeSettings {
         'manualPeers': manualPeers,
         'memoryShare': memoryShare,
         'memoryBasis': memoryBasis.name,
+        'allowExpertStreaming': allowExpertStreaming,
       };
 
   /// Migration: settings written before version 2 had memoryShare 0.8 of free memory as
@@ -378,6 +386,7 @@ class NodeSettings {
       memoryBasis: migrate
           ? MemoryBasis.total
           : MemoryBasis.values.asNameMap()[j['memoryBasis'] as String? ?? ''] ?? MemoryBasis.total,
+      allowExpertStreaming: j['allowExpertStreaming'] as bool? ?? false,
     );
   }
 }

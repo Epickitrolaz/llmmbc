@@ -784,7 +784,8 @@ class _FakeEngine implements InferenceEngine {
   bool _coordinator = false;
 
   @override
-  Future<int> startRpcWorker({required int port, required String cacheDir}) async {
+  Future<int> startRpcWorker(
+      {required int port, String? cacheDir, String? modelPath, bool lazyWeights = false}) async {
     _rpc = true;
     return port;
   }

@@ -61,8 +61,10 @@ abstract class EngineLocator {
 /// Pure function planner. Implementation: `DefaultClusterPlanner` (lib/src/engine/).
 abstract class ClusterPlanner {
   /// Throws [PlanError] if the model cannot fit. `nodes` contains exactly one coordinator
-  /// (`rpcEndpoint == null`).
-  ClusterPlan plan(LocalModel model, List<PlanNode> nodes);
+  /// (`rpcEndpoint == null`). With [allowExpertStreaming] (MoE only, §2.4), expert tensors
+  /// placed on workers may exceed the workers' budgets: they stay memory-mapped on the
+  /// worker's disk and are paged in on demand.
+  ClusterPlan plan(LocalModel model, List<PlanNode> nodes, {bool allowExpertStreaming = false});
 
   /// Converts a plan to llama-server CLI args (excluding `-m`, `--host`, `--port`).
   List<String> llamaServerArgs(ClusterPlan plan);
@@ -70,8 +72,13 @@ abstract class ClusterPlanner {
 
 /// Manages engine processes on this node. Implementation: `LlamaCppEngine` (lib/src/engine/).
 abstract class InferenceEngine {
-  /// Starts rpc-server bound to 0.0.0.0:[port] with a local cache dir; returns actual port.
-  Future<int> startRpcWorker({required int port, required String cacheDir});
+  /// Starts rpc-server bound to 0.0.0.0:[port]; returns the actual port (§6.1).
+  /// [modelPath]: this node's local GGUF of the session model. The patched rpc-server serves
+  /// the coordinator's load-from-file requests from it, so weights never cross the network.
+  /// [lazyWeights]: memory-map those weights instead of copying them into RAM (pages are read
+  /// on first use; used for MoE expert streaming). [cacheDir]: legacy hash cache, null = off.
+  Future<int> startRpcWorker(
+      {required int port, String? cacheDir, String? modelPath, bool lazyWeights = false});
   Future<void> stopRpcWorker();
   bool get rpcWorkerRunning;
 

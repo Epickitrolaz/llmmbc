@@ -52,7 +52,8 @@ nothing for that model (it may still act as a pure client that sends the chat re
 3. R sends `POST /v1/chat/completions` (OpenAI format, `stream: true` supported) to C's node API.
 4. C ensures a **session** for M:
    * Candidate set S = all reachable candidates for M (C's own view, refreshed).
-   * For each other s in S: `POST /v1/rpc/start` → s starts `rpc-server` and returns its port + memory budget.
+   * For each other s in S: `POST /v1/rpc/start` → s starts `rpc-server --model-file <its local GGUF of M>`
+     (plus `--lazy-weights`, §6.1) and returns its port + memory budget.
      Nodes that fail/timeout are dropped from S.
    * `ClusterPlanner.plan(model, S)` → `ClusterPlan` (per-node weights; for MoE optional expert
      placement overrides).
@@ -69,6 +70,12 @@ nothing for that model (it may still act as a pure client that sends the chat re
   `--override-tensor <regex>=RPC[host:port]` so that each forward pass only touches the active experts'
   shards. The planner must always produce a plan whose per-node bytes ≤ that node's budget, or fail
   with `PlanError` ("model does not fit in cluster memory").
+* **Expert streaming** (opt-in, coordinator's `NodeSettings.allowExpertStreaming`, MoE only):
+  `plan(..., allowExpertStreaming: true)` still requires non-expert tensors + KV to fit the
+  coordinator/worker budgets, but the `ffn_*_exps` bytes placed on a worker may exceed its budget
+  (spread proportionally to budget). Workers then run with `lazyWeights` (§6.1): expert pages are
+  read from the worker's own disk only when the router selects them, and the OS keeps hot experts
+  cached. Without the flag the plan must fit RAM as before, but workers still map weights from disk.
 
 ### 2.5 Memory budget
 * Each node lends `budget = HardwareProfile.memoryBudgetBytes(settings.memoryBasis, settings.memoryShare)`:
@@ -118,7 +125,12 @@ timeout.
 * Probe: on start / manual refresh a node sends `{"t":"llmmbc.probe","v":1,"id":<nodeId>}`; receivers
   reply unicast with a beacon.
 * On beacon from an unknown id: fetch `GET http://<sender-ip>:<port>/v1/node` and add to `PeerDirectory`.
-* Peers not seen for 15 s are marked `reachable=false`; dropped after 120 s (manual peers are never dropped).
+* **Liveness does not depend on UDP** (many Wi‑Fi APs and Android drop broadcast/multicast between
+  clients): every known peer not heard from (beacon or HTTP) in the last 5 s is probed with
+  `GET /v1/node` (2 s timeout) every 5 s; a successful probe refreshes `lastSeen` and metadata.
+  A peer is marked `reachable=false` after 3 consecutive failed probes (~15 s) and dropped after
+  120 s unreachable (manual peers are never dropped). A peer that answers again becomes reachable
+  immediately. Discovery runs for the node's whole lifetime, independent of which UI screen is open.
 * Subnet sweep fallback (Docker, emulator, networks that block broadcast): `GET /v1/node` on every
   host of each local /24, 300 ms timeout, ≤ 64 concurrent, on start and on manual refresh.
 * Manual peers: `host[:port]` strings in `NodeSettings.manualPeers` (needed for the Android emulator,
@@ -151,6 +163,26 @@ timeout.
 * `scripts/fetch_engine.sh <target> <outdir>` downloads/builds binaries for a target in
   {`linux-x64`, `linux-arm64`, `windows-x64`, `macos-arm64`, `macos-x64`, `android-arm64`, `android-x64`}.
 * iOS cannot spawn processes: on iOS the app is **client-only** (worker mode forced off, UI says why).
+* **Built from source for every target** with the patches in `native/patches/*.patch` applied in
+  order (`scripts/build_engine.sh`); no upstream prebuilt binaries (they lack §6.1).
+
+### 6.1 Loading weights from the worker's own disk (patched llama.cpp)
+Every worker in a session has the identical GGUF (same sha256, §2.2), so weights are never sent
+over the network:
+* New RPC command `SET_TENSOR_FROM_FILE {tensor, offset, file_offset, size}`, advertised by the
+  server in its HELLO flags. Client API in `ggml-rpc.h`:
+  `ggml_backend_rpc_set_tensor_from_file(tensor, offset, file_offset, size)` returns false when the
+  server lacks support.
+* `rpc-server --model-file <gguf>` opens the session model read-only; requests are bounds-checked
+  against the file size.
+* llama.cpp's model loader (`llama-model-loader.cpp`), for weight tensors whose buffer is an RPC
+  buffer whose server supports it, calls the new API with the tensor's GGUF data offset instead of
+  `ggml_backend_tensor_set` with the bytes. Otherwise it falls back to sending bytes (old behaviour).
+* `rpc-server --lazy-weights`: CPU-backend weights loaded from file are **memory-mapped** (the
+  server maps the GGUF once and points those tensors at the mapping instead of copying), and CPU
+  weight buffers are allocated with lazy/no-reserve memory so unused ranges cost no RAM. Without
+  the flag (or on GPU buffers, or Windows), the server reads from the file into the buffer.
+* The legacy `-c` hash cache is not used; nodes delete `<dataDir>/rpc-cache/` on startup.
 
 ## 7. Ports and constants
 

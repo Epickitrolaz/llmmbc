@@ -216,7 +216,8 @@ class DegradedNodeService implements NodeService {
 
 class _UnavailableEngine implements InferenceEngine {
   @override
-  Future<int> startRpcWorker({required int port, required String cacheDir}) async =>
+  Future<int> startRpcWorker(
+          {required int port, String? cacheDir, String? modelPath, bool lazyWeights = false}) async =>
       throw LlmmbcException('engine_error', 'The core node runtime is unavailable.');
 
   @override

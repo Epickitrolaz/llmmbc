@@ -42,7 +42,10 @@ class LlamaCppEngine implements InferenceEngine {
 
   @override
   Future<int> startRpcWorker(
-      {required int port, required String cacheDir}) async {
+      {required int port,
+      String? cacheDir,
+      String? modelPath,
+      bool lazyWeights = false}) async {
     await stopRpcWorker();
     _rpcExited = false;
     final exe = await _locator.rpcServerPath();
@@ -50,7 +53,9 @@ class LlamaCppEngine implements InferenceEngine {
       throw LlmmbcException('engine_error',
           'rpc-server binary not found (engine location unavailable)');
     }
-    await Directory(cacheDir).create(recursive: true);
+    // TEMPORARY (contract 2026-11-14): engine stream replaces this with the
+    // load-from-file flags (§6.1); until then keep the legacy hash cache.
+    if (cacheDir != null) await Directory(cacheDir).create(recursive: true);
 
     final candidates = await _rpcPortCandidates(port);
     if (candidates.isEmpty) {
@@ -59,7 +64,7 @@ class LlamaCppEngine implements InferenceEngine {
     }
     final env = {
       ...engineProcessEnvironment(File(exe).parent.path),
-      'LLAMA_CACHE': Directory(cacheDir).absolute.path,
+      if (cacheDir != null) 'LLAMA_CACHE': Directory(cacheDir).absolute.path,
     };
 
     String? lastError;
@@ -67,7 +72,7 @@ class LlamaCppEngine implements InferenceEngine {
       _rpcExited = false;
       final process = await _start(
         exe,
-        ['-H', '0.0.0.0', '-p', '$candidate', '-c'],
+        ['-H', '0.0.0.0', '-p', '$candidate', if (cacheDir != null) '-c'],
         env,
         'rpc-server',
       );

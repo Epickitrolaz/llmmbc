@@ -26,7 +26,8 @@ class DefaultClusterPlanner implements ClusterPlanner {
   static const int memoryOverheadPercent = 10;
 
   @override
-  ClusterPlan plan(LocalModel model, List<PlanNode> nodes) {
+  ClusterPlan plan(LocalModel model, List<PlanNode> nodes,
+      {bool allowExpertStreaming = false}) {
     _validateNodes(nodes);
 
     final metadata = model.metadata;

@@ -293,7 +293,10 @@ class FakeEngine implements InferenceEngine {
 
   @override
   Future<int> startRpcWorker(
-      {required int port, required String cacheDir}) async {
+      {required int port,
+      String? cacheDir,
+      String? modelPath,
+      bool lazyWeights = false}) async {
     rpcStarts++;
     concurrentRpcStarts++;
     if (concurrentRpcStarts > maxConcurrentRpcStarts) {
@@ -382,7 +385,8 @@ class FakePlanner implements ClusterPlanner {
   bool fail = false;
 
   @override
-  ClusterPlan plan(LocalModel model, List<PlanNode> nodes) {
+  ClusterPlan plan(LocalModel model, List<PlanNode> nodes,
+      {bool allowExpertStreaming = false}) {
     plans++;
     if (fail) throw PlanError('model does not fit in cluster memory');
     final total = nodes.fold<int>(0, (sum, n) => sum + n.budgetBytes);
