@@ -1,0 +1,791 @@
+diff --git a/ggml/include/ggml-rpc.h b/ggml/include/ggml-rpc.h
+index da1d4e1..ec5ab56 100644
+--- a/ggml/include/ggml-rpc.h
++++ b/ggml/include/ggml-rpc.h
+@@ -8,7 +8,10 @@ extern "C" {
+ 
+ #define RPC_PROTO_MAJOR_VERSION    10
+ #define RPC_PROTO_MINOR_VERSION    0
+-#define RPC_PROTO_PATCH_VERSION    0
++#define RPC_PROTO_PATCH_VERSION    1
++
++// The patch version marks the LLMMBC fork: SET_TENSOR_FROM_FILE is an optional command that the
++// server advertises in its HELLO flags. Minor stays 0 so old and new peers keep interoperating.
+ 
+ #ifdef  __cplusplus
+ static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+@@ -28,10 +31,22 @@ GGML_BACKEND_API void ggml_backend_rpc_get_device_memory(const char * endpoint,
+ GGML_BACKEND_API void ggml_backend_rpc_start_server(
+         const char * endpoint,
+         const char * cache_dir,
++        const char * model_file,
++        bool lazy_weights,
+         size_t n_threads,
+         size_t n_devices,
+         ggml_backend_dev_t * devices);
+ 
++// Ask the server to load a tensor region from its own copy of the GGUF (`rpc-server --model-file`)
++// instead of receiving the bytes over the socket. `file_offset` is the region's offset in that file.
++// Returns false when the tensor is not in an RPC buffer or the server does not support it (older
++// server, no --model-file); callers must then send the bytes as usual.
++typedef bool (*ggml_backend_rpc_set_tensor_from_file_t)(
++        struct ggml_tensor * tensor, size_t offset, size_t file_offset, size_t size);
++
++GGML_BACKEND_API bool ggml_backend_rpc_set_tensor_from_file(
++        struct ggml_tensor * tensor, size_t offset, size_t file_offset, size_t size);
++
+ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_reg(void);
+ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint);
+ 
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index e4a84cb..01a6f53 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -6,6 +6,7 @@
+ #include "log.h"
+ 
+ #include <array>
++#include <cerrno>
+ #include <chrono>
+ #include <cinttypes>
+ #include <optional>
+@@ -22,8 +23,19 @@
+ #include <cstring>
+ #include <fstream>
+ #include <filesystem>
++#include <map>
+ #include <algorithm>
+ #include <atomic>
++#if !defined(_WIN32)
++#  include <fcntl.h>
++#  include <sys/mman.h>
++#  include <sys/stat.h>
++#  include <unistd.h>
++#else
++#  include <fcntl.h>
++#  include <io.h>
++#  include <sys/stat.h>
++#endif
+ 
+ namespace fs = std::filesystem;
+ 
+@@ -78,6 +90,7 @@ enum rpc_cmd {
+     RPC_CMD_COMM_INIT,
+     RPC_CMD_COMM_ALLREDUCE,
+     RPC_CMD_COMM_FREE,
++    RPC_CMD_SET_TENSOR_FROM_FILE,
+     RPC_CMD_NONE,
+     RPC_CMD_COUNT,
+ };
+@@ -109,6 +122,7 @@ static const char * rpc_cmd_name(enum rpc_cmd cmd) {
+         case RPC_CMD_COMM_INIT:         return "COMM_INIT";
+         case RPC_CMD_COMM_ALLREDUCE:    return "COMM_ALLREDUCE";
+         case RPC_CMD_COMM_FREE:         return "COMM_FREE";
++        case RPC_CMD_SET_TENSOR_FROM_FILE: return "SET_TENSOR_FROM_FILE";
+         case RPC_CMD_NONE:              return "NONE";
+         default:                        return "UNKNOWN";
+     }
+@@ -128,6 +142,7 @@ struct rpc_msg_hello_req {
+ // server feature flags in rpc_msg_hello_rsp::flags
+ enum rpc_dispatcher_flags : uint8_t {
+     RPC_DISPATCHER_FLAGS_SEND_TENSOR_HASH = 1 << 0, // client should try SET_TENSOR_HASH before sending tensor data
++    RPC_DISPATCHER_FLAGS_SET_TENSOR_FROM_FILE = 1 << 1, // server can load tensors from its own --model-file
+ };
+ 
+ struct rpc_msg_hello_rsp {
+@@ -222,6 +237,17 @@ struct rpc_msg_get_tensor_req {
+     uint64_t size;
+ };
+ 
++struct rpc_msg_set_tensor_from_file_req {
++    rpc_tensor tensor;
++    uint64_t offset;      // offset inside the tensor
++    uint64_t file_offset; // offset inside the server's --model-file
++    uint64_t size;
++};
++
++struct rpc_msg_set_tensor_from_file_rsp {
++    uint8_t result;
++};
++
+ struct rpc_msg_copy_tensor_req {
+     rpc_tensor src;
+     rpc_tensor dst;
+@@ -533,6 +559,7 @@ public:
+     void work();
+ 
+     bool get_send_tensor_hash() const { return flags & RPC_DISPATCHER_FLAGS_SEND_TENSOR_HASH; }
++    bool get_set_tensor_from_file() const { return flags & RPC_DISPATCHER_FLAGS_SET_TENSOR_FROM_FILE; }
+ 
+     ~rpc_dispatcher();
+ 
+@@ -947,6 +974,27 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
+     ctx->dispatcher->send(RPC_CMD_GET_TENSOR, request, sizeof(*request), nullptr, 0, data, size);
+ }
+ 
++GGML_BACKEND_API bool ggml_backend_rpc_set_tensor_from_file(ggml_tensor * tensor, size_t offset, size_t file_offset, size_t size) {
++    if (tensor == nullptr || tensor->buffer == nullptr || !ggml_backend_buffer_is_rpc(tensor->buffer)) {
++        return false;
++    }
++    ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)tensor->buffer->context;
++    if (!ctx->dispatcher->get_set_tensor_from_file()) {
++        // unpatched server or one started without --model-file: send the bytes instead
++        return false;
++    }
++    auto request = std::make_shared<rpc_msg_set_tensor_from_file_req>();
++    request->tensor      = serialize_tensor(tensor, ctx->dispatcher.get());
++    request->offset      = offset;
++    request->file_offset = file_offset;
++    request->size        = size;
++    LOG_DBG2("[%s] tensor: %s, offset: %zu, file_offset: %zu, size: %s\n", __func__,
++             rpc_log_format_tensor(tensor).c_str(), offset, file_offset, rpc_log_format_size(size).c_str());
++    rpc_msg_set_tensor_from_file_rsp response = {};
++    ctx->dispatcher->send(RPC_CMD_SET_TENSOR_FROM_FILE, request, sizeof(*request), nullptr, 0, &response, sizeof(response));
++    return response.result != 0;
++}
++
+ static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
+     if (ggml_backend_buffer_is_rpc(src->buffer)) {
+         // check if src and dst are on the same server
+@@ -1427,10 +1475,16 @@ void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device,
+ 
+ class rpc_server {
+ public:
+-    rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir)
+-        : backends(std::move(all_backends)), cache_dir(cache_dir) {
++    rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir,
++               const char * model_file, bool lazy_weights)
++        : backends(std::move(all_backends)), cache_dir(cache_dir), lazy_weights(lazy_weights) {
+         stored_graphs.resize(backends.size());
+         comm_states.resize(backends.size());
++        is_cpu.resize(backends.size());
++        for (size_t i = 0; i < backends.size(); i++) {
++            is_cpu[i] = ggml_backend_get_default_buffer_type(backends[i]) == ggml_backend_cpu_buffer_type();
++        }
++        open_model_file(model_file);
+     }
+     ~rpc_server();
+ 
+@@ -1444,6 +1498,7 @@ public:
+     bool memset_tensor(const rpc_msg_memset_tensor_req & request);
+     bool set_tensor(socket_ptr sock, uint64_t input_size);
+     bool set_tensor_2d(const std::vector<uint8_t> & input);
++    bool set_tensor_from_file(const rpc_msg_set_tensor_from_file_req & request, rpc_msg_set_tensor_from_file_rsp & response);
+     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
+     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
+     bool get_tensor_2d(const rpc_msg_get_tensor_2d_req & request, std::vector<uint8_t> & response);
+@@ -1474,6 +1529,12 @@ private:
+                               const std::unordered_map<uint64_t, const rpc_tensor*> & tensor_ptrs,
+                               std::unordered_map<uint64_t, struct ggml_tensor*> & tensor_map);
+ 
++    // --model-file / --lazy-weights (docs/ARCHITECTURE.md §6.1)
++    void open_model_file(const char * model_file);
++    bool read_model_file(void * dst, size_t size, uint64_t offset) const;
++    uint64_t remap_lazy_data(uint64_t remote) const;
++    void log_transfer(const char * op, const ggml_tensor * tensor, size_t size);
++
+ 
+     // Per-device state for one communicator.
+     struct comm_state {
+@@ -1499,22 +1560,158 @@ private:
+ 
+     std::vector<ggml_backend_t> backends;
+     const char * cache_dir;
++    std::vector<bool> is_cpu;
+     std::unordered_set<ggml_backend_buffer_t> buffers;
+     // computed graphs cached per backend, keyed by uid
+     std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
+     std::vector<comm_state> comm_states;
+     // SET_TENSOR data is received in chunks through this buffer
+     std::vector<uint8_t> set_tensor_buf;
++
++    // --model-file: the session model on this worker's own disk. SET_TENSOR_FROM_FILE reads
++    // weight regions from it instead of receiving them over the socket.
++    int       model_fd     = -1;
++    size_t    model_size   = 0;
++    uint8_t * model_map    = nullptr; // --lazy-weights: whole GGUF mapped once
++    bool      lazy_weights = false;
++
++    struct lazy_region {
++        uint64_t  remote;  // client-visible address of the region
++        uint8_t * mapped;  // model_map + file offset
++        size_t    size;
++    };
++    struct lazy_alloc {
++        void * base;
++        size_t size;
++    };
++    // remote tensor data address -> mapping, consulted wherever a tensor is deserialized
++    std::map<uint64_t, lazy_region> lazy_regions;
++    // server buffer pointer -> no-reserve allocation backing it
++    std::unordered_map<uint64_t, lazy_alloc> lazy_allocs;
++
++    // transfer counters for diagnostics and the integration test
++    uint64_t from_file_tensors = 0;
++    uint64_t from_file_bytes   = 0;
++    uint64_t socket_bytes      = 0;
++    uint64_t next_log_bytes    = 16ull << 20;
+ };
+ 
+ void rpc_server::hello(rpc_msg_hello_rsp & response) {
+     response.major = RPC_PROTO_MAJOR_VERSION;
+     response.minor = RPC_PROTO_MINOR_VERSION;
+     response.patch = RPC_PROTO_PATCH_VERSION;
+-    response.flags = cache_dir ? RPC_DISPATCHER_FLAGS_SEND_TENSOR_HASH : 0;
++    response.flags = (cache_dir ? RPC_DISPATCHER_FLAGS_SEND_TENSOR_HASH : 0) |
++                     (model_fd >= 0 ? RPC_DISPATCHER_FLAGS_SET_TENSOR_FROM_FILE : 0);
+     LOG_DBG("[%s] version: %d.%d.%d\n", __func__, response.major, response.minor, response.patch);
+ }
+ 
++void rpc_server::open_model_file(const char * model_file) {
++    if (model_file == nullptr || *model_file == '\0') {
++        return;
++    }
++#if defined(_WIN32)
++    model_fd = _open(model_file, _O_RDONLY | _O_BINARY);
++#else
++    model_fd = ::open(model_file, O_RDONLY);
++#endif
++    if (model_fd < 0) {
++        LOG_ERROR("[%s] failed to open model file '%s'\n", __func__, model_file);
++        return;
++    }
++    std::error_code ec;
++    const auto size = fs::file_size(model_file, ec);
++    if (ec) {
++        LOG_ERROR("[%s] failed to stat model file '%s': %s\n", __func__, model_file, ec.message().c_str());
++#if defined(_WIN32)
++        _close(model_fd);
++#else
++        ::close(model_fd);
++#endif
++        model_fd = -1;
++        return;
++    }
++    model_size = (size_t) size;
++#if !defined(_WIN32)
++    if (lazy_weights && model_size > 0) {
++        // MAP_PRIVATE: the file (opened O_RDONLY) is never modified; stray writes are COW.
++        void * map = mmap(nullptr, model_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, model_fd, 0);
++        if (map == MAP_FAILED) {
++            LOG_WARN("[%s] mmap of '%s' failed (%s); weights will be read from the file instead\n",
++                     __func__, model_file, std::strerror(errno));
++        } else {
++            model_map = (uint8_t *) map;
++        }
++    }
++#endif
++    LOG_INFO("[%s] model file: %s (%s), lazy weights: %s\n", __func__, model_file,
++             rpc_log_format_size(model_size).c_str(),
++             model_map ? "on (GGUF mapped, buffers use MAP_NORESERVE)"
++                       : (lazy_weights ? "requested but unavailable, reading from file" : "off"));
++}
++
++bool rpc_server::read_model_file(void * dst, size_t size, uint64_t offset) const {
++    if (model_fd < 0) {
++        return false;
++    }
++    if (offset > model_size || size > model_size - offset) {
++        LOG_ERROR("[%s] region (offset=%" PRIu64 ", size=%zu) out of model file bounds [0, %zu)\n",
++                  __func__, offset, size, model_size);
++        return false;
++    }
++    constexpr size_t chunk_size = 16 * 1024 * 1024;
++    for (size_t done = 0; done < size; ) {
++        const size_t n = std::min(size - done, chunk_size);
++        uint8_t * out = (uint8_t *) dst + done;
++#if defined(_WIN32)
++        if (_lseeki64(model_fd, (long long) (offset + done), SEEK_SET) < 0) {
++            return false;
++        }
++        const int got = _read(model_fd, out, (unsigned) n);
++        if (got < 0 || (size_t) got != n) {
++            return false;
++        }
++#else
++        ssize_t got;
++        do {
++            got = pread(model_fd, out, n, (off_t) (offset + done));
++        } while (got < 0 && errno == EINTR);
++        if (got < 0 || (size_t) got != n) {
++            return false;
++        }
++#endif
++        done += n;
++    }
++    return true;
++}
++
++uint64_t rpc_server::remap_lazy_data(uint64_t remote) const {
++    if (lazy_regions.empty()) {
++        return remote;
++    }
++    auto it = lazy_regions.upper_bound(remote);
++    if (it == lazy_regions.begin()) {
++        return remote;
++    }
++    --it;
++    if (remote - it->second.remote < it->second.size) {
++        return (uint64_t) (uintptr_t) (it->second.mapped + (remote - it->second.remote));
++    }
++    return remote;
++}
++
++// One machine-readable line every 16 MiB keeps the log bounded during generation; the final
++// line (logged on disconnect) always carries the exact totals.
++void rpc_server::log_transfer(const char * op, const ggml_tensor * tensor, size_t size) {
++    GGML_UNUSED(size);
++    const uint64_t total = from_file_bytes + socket_bytes;
++    if (total < next_log_bytes) {
++        return;
++    }
++    next_log_bytes = (total / (16ull << 20) + 1) * (16ull << 20);
++    LOG_INFO("[%s] %s: %s, totals: from_file_bytes=%" PRIu64 " from_file_tensors=%" PRIu64 " socket_bytes=%" PRIu64 "\n",
++             __func__, op, tensor ? tensor->name : "-", from_file_bytes, from_file_tensors, socket_bytes);
++}
++
+ bool rpc_server::get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response) {
+     uint32_t dev_id = request.device;
+     if (dev_id >= backends.size()) {
+@@ -1562,7 +1759,32 @@ bool rpc_server::alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_
+         return false;
+     }
+     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backends[dev_id]);
+-    ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, request.size);
++    ggml_backend_buffer_t buffer = nullptr;
++#if !defined(_WIN32)
++    // --lazy-weights: weight buffers are backed by lazily committed, no-reserve pages so an
++    // allocation larger than RAM succeeds and untouched ranges cost no RSS. The bytes actually
++    // used are pointed at the GGUF mapping in set_tensor_from_file().
++    if (lazy_weights && is_cpu[dev_id] && request.size > 0) {
++        void * base = mmap(nullptr, request.size, PROT_READ | PROT_WRITE,
++                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
++        if (base != MAP_FAILED) {
++            buffer = ggml_backend_cpu_buffer_from_ptr(base, request.size);
++            if (buffer != nullptr) {
++                lazy_allocs[reinterpret_cast<uint64_t>(buffer)] = { base, request.size };
++                LOG_DBG("[%s] device: %u, size: %s -> lazy (MAP_NORESERVE) allocation\n",
++                        __func__, dev_id, rpc_log_format_size(request.size).c_str());
++            } else {
++                munmap(base, request.size);
++            }
++        } else {
++            LOG_WARN("[%s] MAP_NORESERVE allocation of %s failed (%s); falling back\n",
++                     __func__, rpc_log_format_size(request.size).c_str(), std::strerror(errno));
++        }
++    }
++#endif
++    if (buffer == nullptr) {
++        buffer = ggml_backend_buft_alloc_buffer(buft, request.size);
++    }
+     response.remote_ptr = 0;
+     response.remote_size = 0;
+     if (buffer != nullptr) {
+@@ -1622,6 +1844,10 @@ bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
+         LOG_ERROR("[%s] buffer not found\n", __func__);
+         return false;
+     }
++    const size_t buffer_size = ggml_backend_buffer_get_size(buffer);
++    // lazy_regions are keyed by the client-visible tensor data address (buffer base), not by the
++    // server-side buffer object pointer in request.remote_ptr.
++    const uint64_t buffer_base = (uint64_t) ggml_backend_buffer_get_base(buffer);
+     // Discard all cached graphs to avoid use-after-free in graph_recompute,
+     // since their nodes may hold pointers to the buffer being freed. The client
+     // will have to re-serialize its graphs from now on.
+@@ -1632,6 +1858,19 @@ bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
+     }
+     ggml_backend_buffer_free(buffer);
+     buffers.erase(buffer);
++    auto alloc_it = lazy_allocs.find(request.remote_ptr);
++    if (alloc_it != lazy_allocs.end()) {
++#if !defined(_WIN32)
++        munmap(alloc_it->second.base, alloc_it->second.size);
++#endif
++        lazy_allocs.erase(alloc_it);
++    }
++    // regions pointing into a freed buffer can never be used again
++    for (auto it = lazy_regions.begin(); it != lazy_regions.end(); ) {
++        const bool in_buffer = it->second.remote >= buffer_base &&
++                               it->second.remote < buffer_base + buffer_size;
++        it = in_buffer ? lazy_regions.erase(it) : std::next(it);
++    }
+     return true;
+ }
+ 
+@@ -1746,7 +1985,7 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
+         result->op_params[i] = tensor->op_params[i];
+     }
+     result->flags = tensor->flags;
+-    result->data = reinterpret_cast<void *>(tensor->data);
++    result->data = reinterpret_cast<void *>(remap_lazy_data(tensor->data));
+     ggml_set_name(result, tensor->name);
+     return result;
+ }
+@@ -1796,6 +2035,16 @@ bool rpc_server::set_tensor(socket_ptr sock, uint64_t input_size) {
+             return false;
+         }
+     }
++    {
++        // The buffer check above is not enough for lazily mapped weights: an in-buffer offset can
++        // point past the tensor into the GGUF mapping. Bound writes by the tensor size.
++        const uint64_t tensor_size = (uint64_t) ggml_nbytes(tensor);
++        if (offset > tensor_size || size > tensor_size - offset) {
++            LOG_ERROR("[%s] write region (offset=%" PRIu64 ", size=%zu) out of tensor bounds [0, %" PRIu64 ")\n",
++                      __func__, offset, size, tensor_size);
++            return false;
++        }
++    }
+ 
+     if (cache_dir && cache_flag) {
+         // the whole data is needed to compute the hash
+@@ -1812,6 +2061,8 @@ bool rpc_server::set_tensor(socket_ptr sock, uint64_t input_size) {
+         ofs.write((const char *)data.data(), size);
+         LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
+         ggml_backend_tensor_set(tensor, data.data(), offset, size);
++        socket_bytes += size;
++        log_transfer("SET_TENSOR", tensor, size);
+         return true;
+     }
+ 
+@@ -1828,6 +2079,89 @@ bool rpc_server::set_tensor(socket_ptr sock, uint64_t input_size) {
+         ggml_backend_tensor_set(tensor, set_tensor_buf.data(), offset + done, n);
+         done += n;
+     }
++    socket_bytes += size;
++    log_transfer("SET_TENSOR", tensor, size);
++    return true;
++}
++
++bool rpc_server::set_tensor_from_file(const rpc_msg_set_tensor_from_file_req & request, rpc_msg_set_tensor_from_file_rsp & response) {
++    sync_all_backends();
++    // `response.result = 0` is the fallback signal: the client then sends the bytes with
++    // SET_TENSOR as it would to an old server. Recoverable problems (missing file, bounds
++    // mismatch, short read) therefore keep the connection alive instead of aborting it.
++    response.result = 0;
++    if (model_fd < 0) {
++        LOG_ERROR("[%s] no --model-file on this server, asking the client to send bytes\n", __func__);
++        return true;
++    }
++
++    struct ggml_init_params params {
++        /*.mem_size   =*/ ggml_tensor_overhead(),
++        /*.mem_buffer =*/ NULL,
++        /*.no_alloc   =*/ true,
++    };
++    ggml_context_ptr ctx_ptr { ggml_init(params) };
++    GGML_ASSERT(ctx_ptr != nullptr);
++    ggml_context * ctx = ctx_ptr.get();
++    ggml_tensor * tensor = deserialize_tensor(ctx, &request.tensor);
++    if (tensor == nullptr || tensor->buffer == nullptr) {
++        LOG_ERROR("[%s] error deserializing tensor, asking the client to send bytes\n", __func__);
++        return true;
++    }
++    const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
++    const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
++    if (request.tensor.data < p0 ||
++        request.tensor.data + request.offset >= p1 ||
++        request.size > p1 - request.tensor.data - request.offset) {
++        LOG_ERROR("[%s] tensor data region (data=0x%" PRIx64 ", offset=%" PRIu64 ", size=%" PRIu64 ") "
++                  "out of buffer bounds [0x%zx, 0x%zx), asking the client to send bytes\n",
++                  __func__, request.tensor.data, request.offset, request.size, p0, p1);
++        return true;
++    }
++    const uint64_t tensor_size = (uint64_t) ggml_nbytes(tensor);
++    if (request.offset > tensor_size || request.size > tensor_size - request.offset) {
++        LOG_ERROR("[%s] region (offset=%" PRIu64 ", size=%" PRIu64 ") out of tensor bounds [0, %" PRIu64
++                  "), asking the client to send bytes\n",
++                  __func__, request.offset, request.size, tensor_size);
++        return true;
++    }
++    if (request.file_offset > model_size || request.size > model_size - request.file_offset) {
++        LOG_ERROR("[%s] region (file_offset=%" PRIu64 ", size=%" PRIu64 ") out of model file bounds [0, %zu), "
++                  "asking the client to send bytes\n",
++                  __func__, request.file_offset, request.size, model_size);
++        return true;
++    }
++
++    const uint64_t remote = request.tensor.data + request.offset;
++    // --lazy-weights: point the tensor at the GGUF mapping instead of copying. Only whole-tensor
++    // regions are mapped (the model loader always loads one); sub-regions fall back to copy so a
++    // partially mapped tensor can never mix mapped and anonymous pages.
++    if (model_map != nullptr && request.offset == 0 && request.size == tensor_size &&
++        lazy_allocs.find(request.tensor.buffer) != lazy_allocs.end()) {
++        lazy_regions[remote] = { remote, model_map + request.file_offset, (size_t) request.size };
++        LOG_DBG2("[%s] mapped '%s' (%" PRIu64 " bytes at file offset %" PRIu64 ") at %p\n",
++                 __func__, tensor->name, request.size, request.file_offset, (void *) remote);
++    } else {
++        constexpr size_t chunk_size = 16 * 1024 * 1024;
++        if (set_tensor_buf.size() < std::min((size_t) request.size, chunk_size)) {
++            set_tensor_buf.resize(std::min((size_t) request.size, chunk_size));
++        }
++        for (size_t done = 0; done < request.size; ) {
++            const size_t n = std::min((size_t) request.size - done, chunk_size);
++            if (!read_model_file(set_tensor_buf.data(), n, request.file_offset + done)) {
++                LOG_ERROR("[%s] failed to read '%s' from the model file, asking the client to send bytes\n",
++                          __func__, tensor->name);
++                return true;
++            }
++            ggml_backend_tensor_set(tensor, set_tensor_buf.data(), request.offset + done, n);
++            done += n;
++        }
++    }
++
++    from_file_tensors++;
++    from_file_bytes += request.size;
++    log_transfer("SET_TENSOR_FROM_FILE", tensor, (size_t) request.size);
++    response.result = 1;
+     return true;
+ }
+ 
+@@ -1890,6 +2224,8 @@ bool rpc_server::set_tensor_2d(const std::vector<uint8_t> & input) {
+ 
+     const void * data = input.data() + sizeof(rpc_tensor) + 4*sizeof(uint64_t);
+     ggml_backend_tensor_set_2d(tensor, data, offset, size, n_copies, stride, size);
++    socket_bytes += data_size;
++    log_transfer("SET_TENSOR_2D", tensor, (size_t) data_size);
+     return true;
+ }
+ 
+@@ -1955,6 +2291,14 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
+             return false;
+         }
+     }
++    {
++        const uint64_t tensor_size = (uint64_t) ggml_nbytes(tensor);
++        if (request.offset > tensor_size || size > tensor_size - request.offset) {
++            LOG_ERROR("[%s] cached region (offset=%" PRIu64 ", size=%zu) out of tensor bounds [0, %" PRIu64 ")\n",
++                      __func__, request.offset, size, tensor_size);
++            return false;
++        }
++    }
+     ggml_backend_tensor_set(tensor, cached_file.data(), request.offset, size);
+     response.result = 1;
+     return true;
+@@ -2652,14 +2996,39 @@ rpc_server::~rpc_server() {
+     for (uint32_t dev_id = 0; dev_id < comm_states.size(); dev_id++) {
+         comm_free_device(dev_id);
+     }
++    if (from_file_tensors > 0 || socket_bytes > 0) {
++        LOG_INFO("[%s] totals: from_file_bytes=%" PRIu64 " from_file_tensors=%" PRIu64 " socket_bytes=%" PRIu64 "\n",
++                 __func__, from_file_bytes, from_file_tensors, socket_bytes);
++    }
+     for (auto buffer : buffers) {
+         ggml_backend_buffer_free(buffer);
+     }
++    for (const auto & alloc : lazy_allocs) {
++#if !defined(_WIN32)
++        munmap(alloc.second.base, alloc.second.size);
++#endif
++    }
++    lazy_allocs.clear();
++    lazy_regions.clear();
++#if !defined(_WIN32)
++    if (model_map != nullptr) {
++        munmap(model_map, model_size);
++        model_map = nullptr;
++    }
++#endif
++    if (model_fd >= 0) {
++#if defined(_WIN32)
++        _close(model_fd);
++#else
++        ::close(model_fd);
++#endif
++        model_fd = -1;
++    }
+ }
+ 
+ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
+-                             socket_ptr sock) {
+-    rpc_server server(backends, cache_dir);
++                             const char * model_file, bool lazy_weights, socket_ptr sock) {
++    rpc_server server(backends, cache_dir, model_file, lazy_weights);
+     uint8_t cmd;
+     if (!sock->recv_data(&cmd, 1)) {
+         return;
+@@ -2963,6 +3332,20 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
+                 }
+                 break;
+             }
++            case RPC_CMD_SET_TENSOR_FROM_FILE: {
++                rpc_msg_set_tensor_from_file_req request;
++                if (!recv_msg(sock, &request, sizeof(request))) {
++                    return;
++                }
++                rpc_msg_set_tensor_from_file_rsp response;
++                if (!server.set_tensor_from_file(request, response)) {
++                    return;
++                }
++                if (!send_msg(sock, &response, sizeof(response))) {
++                    return;
++                }
++                break;
++            }
+             case RPC_CMD_GET_DEVICE_MEMORY: {
+                 rpc_msg_get_device_memory_req request;
+                 if (!recv_msg(sock, &request, sizeof(request))) {
+@@ -2986,6 +3369,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
+ }
+ 
+ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
++                                   const char * model_file, bool lazy_weights,
+                                    size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
+     if (n_devices == 0 || devices == nullptr) {
+         LOG_ERROR("Invalid arguments to ggml_backend_rpc_start_server\n");
+@@ -2998,6 +3382,7 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
+         RPC_PROTO_PATCH_VERSION);
+     LOG_INFO("  endpoint       : %s\n", endpoint);
+     LOG_INFO("  local cache    : %s\n", cache_dir ? cache_dir : "n/a");
++    LOG_INFO("  model file     : %s%s\n", model_file ? model_file : "n/a", lazy_weights ? " (lazy weights)" : "");
+     LOG_INFO("Devices:\n");
+     for (size_t i = 0; i < n_devices; i++) {
+         auto dev = devices[i];
+@@ -3047,7 +3432,7 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
+             return;
+         }
+         LOG_INFO("Accepted client connection\n");
+-        rpc_serve_client(backends, cache_dir, client_socket);
++        rpc_serve_client(backends, cache_dir, model_file, lazy_weights, client_socket);
+         LOG_INFO("Client connection closed\n");
+     }
+     rpc_transport_shutdown();
+@@ -3337,6 +3722,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
+     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
+         return (void *)ggml_backend_rpc_start_server;
+     }
++    if (std::strcmp(name, "ggml_backend_rpc_set_tensor_from_file") == 0) {
++        return (void *)ggml_backend_rpc_set_tensor_from_file;
++    }
+     if (std::strcmp(name, "ggml_backend_comm_init") == 0) {
+         return (void *)ggml_backend_rpc_comm_init;
+     }
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 2cbee61..0caea97 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "ggml-alloc.h"
+ #include "ggml.h"
++#include "ggml-rpc.h"
+ #include "gguf.h"
+ #include "llama-hparams.h"
+ #include "llama.h"
+@@ -19,6 +20,28 @@ static const size_t kiB = 1024;
+ static const size_t MiB = 1024*kiB;
+ static const size_t GiB = 1024*MiB;
+ 
++// Every worker of a session has the same GGUF (docs/ARCHITECTURE.md §2.2, §6.1), so weight
++// tensors that live in an RPC buffer are loaded from the worker's own copy instead of being sent
++// over the socket. Returns false for local buffers and for servers without --model-file (the
++// HELLO flag is checked client-side, so this costs no round trip); the caller then sends bytes.
++static bool llama_rpc_set_tensor_from_file(ggml_tensor * tensor, size_t offset, size_t file_offset, size_t size) {
++    if (tensor->buffer == nullptr) {
++        return false;
++    }
++    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(tensor->buffer);
++    if (std::strncmp(ggml_backend_buft_name(buft), "RPC", 3) != 0) {
++        return false;
++    }
++    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
++    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
++    if (reg == nullptr) {
++        return false;
++    }
++    auto fn = (ggml_backend_rpc_set_tensor_from_file_t)
++        ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_set_tensor_from_file");
++    return fn != nullptr && fn(tensor, offset, file_offset, size);
++}
++
+ const char * llama_file_version_name(llama_fver version) {
+     switch (version) {
+         case GGUF_FILE_VERSION_V1: return "GGUF V1 (support until nov 2023)";
+@@ -1792,6 +1815,14 @@ bool llama_model_loader::load_all_data(
+ 
+         size_t n_size = ggml_nbytes(cur);
+ 
++        // Load a weight from the worker's own GGUF when it supports it. This is checked before
++        // the mmap pointer is even computed, so the coordinator never touches those pages.
++        if (files.size() == 1 && cur->data != nullptr &&
++            llama_rpc_set_tensor_from_file(cur, 0, weight->offs, n_size)) {
++            size_done += n_size;
++            continue;
++        }
++
+         const bool from_mapping = use_mmap || lazy.has(cur);
+ 
+         if (from_mapping) {
+diff --git a/tools/rpc/rpc-server.cpp b/tools/rpc/rpc-server.cpp
+index 8aeb15d..9eebd90 100644
+--- a/tools/rpc/rpc-server.cpp
++++ b/tools/rpc/rpc-server.cpp
+@@ -76,10 +76,12 @@ static bool common_create_directories(const std::filesystem::path & path, std::e
+ }
+ 
+ struct rpc_server_params {
+-    std::string              host        = "127.0.0.1";
+-    int                      port        = 50052;
+-    bool                     use_cache   = false;
+-    int                      n_threads   = std::max(1U, std::thread::hardware_concurrency()/2);
++    std::string              host         = "127.0.0.1";
++    int                      port         = 50052;
++    bool                     use_cache    = false;
++    std::string              model_file;
++    bool                     lazy_weights = false;
++    int                      n_threads    = std::max(1U, std::thread::hardware_concurrency()/2);
+     std::vector<std::string> devices;
+ };
+ 
+@@ -92,6 +94,10 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
+     fprintf(stderr, "  -H, --host HOST                  host to bind to (default: %s)\n", params.host.c_str());
+     fprintf(stderr, "  -p, --port PORT                  port to bind to (default: %d)\n", params.port);
+     fprintf(stderr, "  -c, --cache                      enable local file cache\n");
++    fprintf(stderr, "  -m, --model-file FILE            serve weight tensors from this local GGUF copy; the\n");
++    fprintf(stderr, "                                   coordinator then sends file offsets instead of bytes\n");
++    fprintf(stderr, "      --lazy-weights               mmap the model file and point CPU weight tensors at it\n");
++    fprintf(stderr, "                                   (requires --model-file; POSIX only)\n");
+     fprintf(stderr, "\n");
+ }
+ 
+@@ -139,6 +145,13 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params &
+             }
+         } else if (arg == "-c" || arg == "--cache") {
+             params.use_cache = true;
++        } else if (arg == "-m" || arg == "--model-file") {
++            if (++i >= argc) {
++                return false;
++            }
++            params.model_file = argv[i];
++        } else if (arg == "--lazy-weights") {
++            params.lazy_weights = true;
+         } else if (arg == "-h" || arg == "--help") {
+             print_usage(argc, argv, params);
+             exit(0);
+@@ -205,6 +218,18 @@ int main(int argc, char * argv[]) {
+         return 1;
+     }
+ 
++    if (params.lazy_weights && params.model_file.empty()) {
++        fprintf(stderr, "error: --lazy-weights requires --model-file\n");
++        return 1;
++    }
++    if (!params.model_file.empty()) {
++        std::error_code ec;
++        if (!std::filesystem::is_regular_file(params.model_file, ec)) {
++            fprintf(stderr, "error: model file '%s' does not exist or is not a file\n", params.model_file.c_str());
++            return 1;
++        }
++    }
++
+     if (params.host != "127.0.0.1") {
+         fprintf(stderr, "\n");
+         fprintf(stderr, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
+@@ -247,6 +272,7 @@ int main(int argc, char * argv[]) {
+         return 1;
+     }
+ 
+-    start_server_fn(endpoint.c_str(), cache_dir, params.n_threads, devices.size(), devices.data());
++    start_server_fn(endpoint.c_str(), cache_dir, params.model_file.empty() ? nullptr : params.model_file.c_str(),
++                    params.lazy_weights, params.n_threads, devices.size(), devices.data());
+     return 0;
+ }

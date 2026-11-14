@@ -5,8 +5,9 @@
 #   docker build -f docker/Dockerfile .
 #   docker buildx build --platform linux/arm64 -f docker/Dockerfile .
 #
-# Stage 1 needs scripts/fetch_engine.sh (owned by the engine stream). Until that
-# lands, the build stops at the guarded RUN below with an explicit message.
+# Stage 1 needs scripts/fetch_engine.sh (owned by the engine stream) and the llama.cpp
+# patches in native/patches/. The engine is always built from source: upstream release
+# archives lack SET_TENSOR_FROM_FILE / --lazy-weights (docs/ARCHITECTURE.md §6.1).
 
 ARG DEBIAN_VERSION=bookworm-slim
 
@@ -38,9 +39,12 @@ RUN set -eux; \
       echo "ERROR: scripts/fetch_engine.sh is missing (engine stream, docs/ARCHITECTURE.md §6)." >&2; \
       exit 1; \
     fi; \
+    [ -d native/patches ] || { echo "ERROR: native/patches/ is missing (docs/ARCHITECTURE.md §6.1)." >&2; exit 1; }; \
     bash scripts/fetch_engine.sh "${target}" /out/engine; \
     test -x /out/engine/llama-server; \
-    test -x /out/engine/rpc-server
+    test -x /out/engine/rpc-server; \
+    /out/engine/rpc-server --help 2>&1 | grep -q -- '--model-file'; \
+    /out/engine/rpc-server --help 2>&1 | grep -q -- '--lazy-weights'
 
 # ---------------------------------------------------------------------------
 # Stage 2: compile the headless node CLI.

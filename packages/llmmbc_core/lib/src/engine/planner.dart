@@ -14,6 +14,12 @@ import '../models.dart';
 /// attention/shared tensors on the coordinator when they fit and spread the
 /// `ffn_*_exps` tensors as contiguous layer ranges over the workers with
 /// `--override-tensor` rules.
+///
+/// With [ClusterPlanner.plan]'s `allowExpertStreaming` (MoE only) the plan only
+/// requires non-expert weights + KV to fit: expert layers are spread over all
+/// nodes proportionally to their budgets, so a worker may hold more expert
+/// bytes than its budget. Workers run `rpc-server --lazy-weights`, so those
+/// bytes stay on disk until the router selects an expert (docs §2.4, §6.1).
 class DefaultClusterPlanner implements ClusterPlanner {
   const DefaultClusterPlanner();
 
@@ -35,12 +41,27 @@ class DefaultClusterPlanner implements ClusterPlanner {
     final weights = _weightsBytes(model);
     final kvBytes = _kvBytes(metadata, contextLength);
     final totalWithOverhead = _withOverhead(weights + kvBytes);
+    final blockCount =
+        metadata != null && metadata.blockCount > 0 ? metadata.blockCount : 1;
+    final isMoe = metadata != null &&
+        metadata.isMoe &&
+        metadata.expertTensorBytes > 0 &&
+        metadata.expertTensorBytes < weights;
+    // §2.4: with expert streaming, expert shards on the workers may exceed their
+    // budgets (they stay on disk and are paged in on demand); non-expert weights
+    // and KV still have to fit.
+    final streaming = allowExpertStreaming && isMoe;
+    final expertBytes =
+        metadata == null ? 0 : math.min(metadata.expertTensorBytes, weights);
+    final requiredWithOverhead = streaming
+        ? _withOverhead(weights - expertBytes + kvBytes)
+        : totalWithOverhead;
 
     final budgetSum = nodes.fold<int>(
         0, (a, n) => a + (n.budgetBytes > 0 ? n.budgetBytes : 0));
-    if (budgetSum < totalWithOverhead) {
+    if (budgetSum < requiredWithOverhead) {
       throw PlanError(
-          'model does not fit in cluster memory: needs ${_fmt(totalWithOverhead)}, '
+          'model does not fit in cluster memory: needs ${_fmt(requiredWithOverhead)}, '
           'cluster offers ${_fmt(budgetSum)}');
     }
 
@@ -48,10 +69,6 @@ class DefaultClusterPlanner implements ClusterPlanner {
       return _planUnknownDense(model, nodes, totalWithOverhead, contextLength);
     }
 
-    final blockCount = metadata.blockCount > 0 ? metadata.blockCount : 1;
-    final isMoe = metadata.isMoe &&
-        metadata.expertTensorBytes > 0 &&
-        metadata.expertTensorBytes < weights;
     if (isMoe) {
       return _planMoe(
         model: model,
@@ -62,6 +79,7 @@ class DefaultClusterPlanner implements ClusterPlanner {
         totalWithOverhead: totalWithOverhead,
         blockCount: blockCount,
         contextLength: contextLength,
+        allowExpertStreaming: streaming,
       );
     }
     return _planDense(
@@ -292,6 +310,7 @@ class DefaultClusterPlanner implements ClusterPlanner {
     required int totalWithOverhead,
     required int blockCount,
     required int contextLength,
+    required bool allowExpertStreaming,
   }) {
     final expertBytes = math.min(metadata.expertTensorBytes, weights);
     final nonExpertBytes = weights - expertBytes;
@@ -340,22 +359,42 @@ class DefaultClusterPlanner implements ClusterPlanner {
       coordinatorAttention = attentionLayers[coordinator.nodeId] ?? 0;
     }
 
-    // 2. Expert tensors: spread all expert layers by remaining capacity.
-    final expertLayerCost =
-        _withOverhead((expertBytes + blockCount - 1) ~/ blockCount);
-    final expertCaps = <String, int>{};
-    for (final n in nodes) {
-      final used = _attentionBytes(n, attentionLayers[n.nodeId] ?? 0,
-          nonExpertBytes, kvBytes, blockCount);
-      final available = math.max(0, n.budgetBytes - used);
-      expertCaps[n.nodeId] = available ~/ expertLayerCost;
+    // 2. Expert tensors: spread all expert layers by remaining capacity, or, with
+    //    expert streaming (§2.4), proportionally to the workers' budgets while allowing
+    //    them to exceed it. Every expert layer is always covered exactly once.
+    //    Streaming experts live on workers only: they are the nodes that run
+    //    `rpc-server --lazy-weights`, while the coordinator keeps attention/KV locally.
+    final Map<String, int> expertLayers;
+    if (allowExpertStreaming) {
+      final workers = [
+        for (final n in nodes)
+          if (!n.isCoordinator && n.budgetBytes > 0) n,
+      ];
+      if (workers.isEmpty) {
+        throw PlanError(
+            'model does not fit in cluster memory: expert streaming needs a worker');
+      }
+      expertLayers = {
+        for (final n in nodes) n.nodeId: 0,
+        ..._spreadByBudget(workers, blockCount),
+      };
+    } else {
+      final expertLayerCost =
+          _withOverhead((expertBytes + blockCount - 1) ~/ blockCount);
+      final expertCaps = <String, int>{};
+      for (final n in nodes) {
+        final used = _attentionBytes(n, attentionLayers[n.nodeId] ?? 0,
+            nonExpertBytes, kvBytes, blockCount);
+        final available = math.max(0, n.budgetBytes - used);
+        expertCaps[n.nodeId] = available ~/ expertLayerCost;
+      }
+      expertLayers = _waterfill(
+        nodes: nodes,
+        caps: expertCaps,
+        count: blockCount,
+        what: 'model does not fit in cluster memory: expert tensors do not fit',
+      );
     }
-    final expertLayers = _waterfill(
-      nodes: nodes,
-      caps: expertCaps,
-      count: blockCount,
-      what: 'model does not fit in cluster memory: expert tensors do not fit',
-    );
 
     // 3. Assign contiguous layer ranges and per-node bytes.
     final overrides = <String>[];
@@ -396,7 +435,23 @@ class DefaultClusterPlanner implements ClusterPlanner {
       for (var i = 0; i < nodes.length; i++)
         if (active.contains(nodes[i])) assignments[i],
     ];
-    _verifyBudgets(active, activeAssignments, 'does not fit');
+    if (allowExpertStreaming) {
+      // Only non-expert weights + KV have to fit; a worker's expert shard may exceed
+      // its budget. The coordinator holds no experts, so its full estimate is checked.
+      final hardBytes = <String, int>{};
+      for (var i = 0; i < nodes.length; i++) {
+        final n = nodes[i];
+        if (!active.contains(n)) continue;
+        hardBytes[n.nodeId] = n.isCoordinator
+            ? assignments[i].estimatedBytes
+            : _attentionBytes(n, attentionLayers[n.nodeId] ?? 0, nonExpertBytes,
+                kvBytes, blockCount);
+      }
+      _verifyBudgets(active, activeAssignments, 'does not fit',
+          hardBytes: hardBytes);
+    } else {
+      _verifyBudgets(active, activeAssignments, 'does not fit');
+    }
 
     // Non-coordinator nodes that only hold expert shards still need a positive
     // layer fraction so they are not dropped by consumers that filter zero
@@ -520,14 +575,48 @@ class DefaultClusterPlanner implements ClusterPlanner {
     return candidate.nodeId.compareTo(current.nodeId) < 0;
   }
 
+  /// Expert streaming: distributes [count] expert layers proportionally to each node's
+  /// budget, ignoring spare capacity. Largest-remainder rounding keeps it deterministic
+  /// and covers every layer exactly once.
+  Map<String, int> _spreadByBudget(List<PlanNode> nodes, int count) {
+    final budgets = {
+      for (final n in nodes) n.nodeId: math.max(0, n.budgetBytes),
+    };
+    final sum = budgets.values.fold<int>(0, (a, b) => a + b);
+    if (sum <= 0 || count <= 0) {
+      throw PlanError(
+          'model does not fit in cluster memory: no budget for expert shards');
+    }
+    final layers = {
+      for (final n in nodes) n.nodeId: (count * budgets[n.nodeId]!) ~/ sum,
+    };
+    var remaining = count - layers.values.fold<int>(0, (a, b) => a + b);
+    final order = [...nodes]..sort((a, b) {
+        final remainderA = (count * budgets[a.nodeId]!) % sum;
+        final remainderB = (count * budgets[b.nodeId]!) % sum;
+        final byRemainder = remainderB.compareTo(remainderA);
+        if (byRemainder != 0) return byRemainder;
+        if (a.isCoordinator != b.isCoordinator) return a.isCoordinator ? -1 : 1;
+        return a.nodeId.compareTo(b.nodeId);
+      });
+    for (var i = 0; remaining > 0; i = (i + 1) % order.length) {
+      final node = order[i];
+      layers[node.nodeId] = layers[node.nodeId]! + 1;
+      remaining--;
+    }
+    return layers;
+  }
+
   void _verifyBudgets(
-      List<PlanNode> nodes, List<PlanAssignment> assignments, String reason) {
+      List<PlanNode> nodes, List<PlanAssignment> assignments, String reason,
+      {Map<String, int>? hardBytes}) {
     final budgets = {for (final n in nodes) n.nodeId: n.budgetBytes};
     for (final a in assignments) {
       final budget = budgets[a.nodeId] ?? 0;
-      if (a.estimatedBytes > budget) {
+      final bytes = hardBytes?[a.nodeId] ?? a.estimatedBytes;
+      if (bytes > budget) {
         throw PlanError('model does not fit in cluster memory ($reason): '
-            'node ${a.nodeId} needs ${_fmt(a.estimatedBytes)}, budget ${_fmt(budget)}');
+            'node ${a.nodeId} needs ${_fmt(bytes)}, budget ${_fmt(budget)}');
       }
     }
     final sum = assignments.fold<double>(0, (a, x) => a + x.layerFraction);
