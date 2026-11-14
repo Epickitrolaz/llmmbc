@@ -359,42 +359,51 @@ class DefaultClusterPlanner implements ClusterPlanner {
       coordinatorAttention = attentionLayers[coordinator.nodeId] ?? 0;
     }
 
-    // 2. Expert tensors: spread all expert layers by remaining capacity, or, with
-    //    expert streaming (§2.4), proportionally to the workers' budgets while allowing
-    //    them to exceed it. Every expert layer is always covered exactly once.
-    //    Streaming experts live on workers only: they are the nodes that run
-    //    `rpc-server --lazy-weights`, while the coordinator keeps attention/KV locally.
-    final Map<String, int> expertLayers;
-    if (allowExpertStreaming) {
-      final workers = [
-        for (final n in nodes)
-          if (!n.isCoordinator && n.budgetBytes > 0) n,
-      ];
-      if (workers.isEmpty) {
-        throw PlanError(
-            'model does not fit in cluster memory: expert streaming needs a worker');
-      }
-      expertLayers = {
-        for (final n in nodes) n.nodeId: 0,
-        ..._spreadByBudget(workers, blockCount),
-      };
-    } else {
-      final expertLayerCost =
-          _withOverhead((expertBytes + blockCount - 1) ~/ blockCount);
-      final expertCaps = <String, int>{};
-      for (final n in nodes) {
-        final used = _attentionBytes(n, attentionLayers[n.nodeId] ?? 0,
-            nonExpertBytes, kvBytes, blockCount);
-        final available = math.max(0, n.budgetBytes - used);
-        expertCaps[n.nodeId] = available ~/ expertLayerCost;
-      }
-      expertLayers = _waterfill(
+    // 2. Expert tensors: prefer the normal capacity-based split. With expert streaming
+    //    (§2.4) fall back to spreading every expert layer over the workers in proportion
+    //    to their budgets, allowing them to exceed it. Streaming experts live on workers
+    //    only: they are the nodes that run `rpc-server --lazy-weights`, while the
+    //    coordinator keeps attention/KV locally.
+    //    Streaming is a relaxation, never a requirement: when the normal split fits, or
+    //    when no worker lends memory (single node, all workers at zero budget), the plan
+    //    is exactly the one produced with the flag off.
+    final streamingWorkers = [
+      for (final n in nodes)
+        if (!n.isCoordinator && n.budgetBytes > 0) n,
+    ];
+
+    Map<String, int>? normalExpertLayers;
+    if (!allowExpertStreaming || streamingWorkers.isEmpty) {
+      normalExpertLayers = _normalExpertLayers(
         nodes: nodes,
-        caps: expertCaps,
-        count: blockCount,
-        what: 'model does not fit in cluster memory: expert tensors do not fit',
+        attentionLayers: attentionLayers,
+        expertBytes: expertBytes,
+        nonExpertBytes: nonExpertBytes,
+        kvBytes: kvBytes,
+        blockCount: blockCount,
       );
+    } else {
+      try {
+        normalExpertLayers = _normalExpertLayers(
+          nodes: nodes,
+          attentionLayers: attentionLayers,
+          expertBytes: expertBytes,
+          nonExpertBytes: nonExpertBytes,
+          kvBytes: kvBytes,
+          blockCount: blockCount,
+        );
+      } on PlanError {
+        // Experts do not fit the workers' remaining budgets: stream them instead.
+        normalExpertLayers = null;
+      }
     }
+    final streaming = normalExpertLayers == null;
+    final expertLayers = streaming
+        ? <String, int>{
+            for (final n in nodes) n.nodeId: 0,
+            ..._spreadByBudget(streamingWorkers, blockCount),
+          }
+        : normalExpertLayers;
 
     // 3. Assign contiguous layer ranges and per-node bytes.
     final overrides = <String>[];
@@ -435,7 +444,7 @@ class DefaultClusterPlanner implements ClusterPlanner {
       for (var i = 0; i < nodes.length; i++)
         if (active.contains(nodes[i])) assignments[i],
     ];
-    if (allowExpertStreaming) {
+    if (streaming) {
       // Only non-expert weights + KV have to fit; a worker's expert shard may exceed
       // its budget. The coordinator holds no experts, so its full estimate is checked.
       final hardBytes = <String, int>{};
@@ -463,6 +472,34 @@ class DefaultClusterPlanner implements ClusterPlanner {
       assignments: activeAssignments,
       tensorOverrides: overrides,
       contextLength: contextLength,
+    );
+  }
+
+  /// Capacity-based expert allocation: every node gets expert layers for the
+  /// budget it has left after attention/KV. Throws [PlanError] when all layers
+  /// cannot be placed this way (the caller may then stream them).
+  Map<String, int> _normalExpertLayers({
+    required List<PlanNode> nodes,
+    required Map<String, int> attentionLayers,
+    required int expertBytes,
+    required int nonExpertBytes,
+    required int kvBytes,
+    required int blockCount,
+  }) {
+    final expertLayerCost =
+        _withOverhead((expertBytes + blockCount - 1) ~/ blockCount);
+    final expertCaps = <String, int>{};
+    for (final n in nodes) {
+      final used = _attentionBytes(n, attentionLayers[n.nodeId] ?? 0,
+          nonExpertBytes, kvBytes, blockCount);
+      final available = math.max(0, n.budgetBytes - used);
+      expertCaps[n.nodeId] = available ~/ expertLayerCost;
+    }
+    return _waterfill(
+      nodes: nodes,
+      caps: expertCaps,
+      count: blockCount,
+      what: 'model does not fit in cluster memory: expert tensors do not fit',
     );
   }
 
