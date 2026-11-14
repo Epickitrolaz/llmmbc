@@ -290,17 +290,18 @@ void main() {
     });
 
     test('expert streaming spreads expert layers proportionally to budget', () {
+      // Attention (~3.85 GiB) fits the coordinator, but the experts do not:
+      // the workers (1 and 2 GiB) are forced to stream them.
       final m = model(moeMeta());
-      final plan = planner.plan(
-        m,
-        [
-          coordinator(16 * _gib),
-          worker('w1', 4 * _gib),
-          worker('w2', 8 * _gib, host: '10.0.0.3', port: 50053),
-        ],
-        allowExpertStreaming: true,
-      );
-      // 48 expert layers over the two workers (4 and 8 GiB): 16 and 32.
+      final nodes = [
+        coordinator(4 * _gib),
+        worker('w1', 1 * _gib),
+        worker('w2', 2 * _gib, host: '10.0.0.3', port: 50053),
+      ];
+      expect(() => planner.plan(m, nodes), throwsA(isA<PlanError>()));
+
+      final plan = planner.plan(m, nodes, allowExpertStreaming: true);
+      // 48 expert layers over the two workers (1 and 2 GiB): 16 and 32.
       final ranges = _parseRanges(plan.tensorOverrides);
       final byDevice = {
         for (final r in ranges) r.device: r.layers.length,
@@ -310,6 +311,70 @@ void main() {
       expect(byDevice['RPC0[10.0.0.2:50052]'], 16);
       expect(byDevice['RPC0[10.0.0.3:50053]'], 32);
       expect(_allLayers(ranges), List.generate(48, (i) => i));
+    });
+
+    test('expert streaming on a single node plans like the flag being off', () {
+      final m = model(moeMeta());
+      final nodes = [coordinator(16 * _gib)];
+      final plain = planner.plan(m, nodes);
+      final streaming = planner.plan(m, nodes, allowExpertStreaming: true);
+      _expectSamePlan(plain, streaming);
+      // No worker exists, so the experts stay on the coordinator's CPU buffer.
+      expect(_parseRanges(plain.tensorOverrides).single.device, 'CPU');
+    });
+
+    test(
+        'expert streaming with only zero-budget workers plans like the flag off',
+        () {
+      final m = model(moeMeta());
+      final nodes = [
+        coordinator(16 * _gib),
+        worker('w0', 0),
+      ];
+      final plain = planner.plan(m, nodes);
+      final streaming = planner.plan(m, nodes, allowExpertStreaming: true);
+      _expectSamePlan(plain, streaming);
+      expect(streaming.nodes.map((n) => n.nodeId), ['coordinator']);
+      expect(_parseRanges(plain.tensorOverrides).single.device, 'CPU');
+    });
+
+    test('expert streaming with one worker streams every expert layer to it',
+        () {
+      final m = model(moeMeta());
+      final nodes = [
+        coordinator(4 * _gib),
+        worker('w1', 1 * _gib),
+      ];
+      // Experts do not fit the 1 GiB worker, so the normal plan fails.
+      expect(() => planner.plan(m, nodes), throwsA(isA<PlanError>()));
+
+      final plan = planner.plan(m, nodes, allowExpertStreaming: true);
+      expect(plan.nodes, hasLength(2));
+      final ranges = _parseRanges(plan.tensorOverrides);
+      expect(ranges.single.device, 'RPC0[10.0.0.2:50052]');
+      expect(_allLayers(ranges), List.generate(48, (i) => i));
+
+      final coordinatorAssignment =
+          plan.assignments.firstWhere((a) => a.nodeId == 'coordinator');
+      expect(coordinatorAssignment.layerFraction, 1.0);
+      expect(coordinatorAssignment.estimatedBytes, lessThanOrEqualTo(4 * _gib),
+          reason: 'attention/KV still have to fit the coordinator');
+      final workerAssignment =
+          plan.assignments.firstWhere((a) => a.nodeId == 'w1');
+      expect(workerAssignment.estimatedBytes, greaterThan(1 * _gib),
+          reason: 'the expert shard streams past the worker budget');
+    });
+
+    test('expert streaming is a no-op when the model already fits', () {
+      final m = model(moeMeta());
+      final nodes = [
+        coordinator(16 * _gib),
+        worker('w1', 4 * _gib),
+        worker('w2', 8 * _gib, host: '10.0.0.3', port: 50053),
+      ];
+      final plain = planner.plan(m, nodes);
+      final streaming = planner.plan(m, nodes, allowExpertStreaming: true);
+      _expectSamePlan(plain, streaming);
     });
 
     test('expert streaming does not relax dense plans', () {
@@ -440,6 +505,17 @@ void main() {
       }
     });
   });
+}
+
+/// A streaming plan that is not needed must be identical to the flag-off plan.
+void _expectSamePlan(ClusterPlan a, ClusterPlan b) {
+  expect(b.model, a.model);
+  expect(b.contextLength, a.contextLength);
+  expect(b.nodes.map((n) => n.nodeId), a.nodes.map((n) => n.nodeId));
+  expect(
+      b.assignments.map((x) => (x.nodeId, x.layerFraction, x.estimatedBytes)),
+      a.assignments.map((x) => (x.nodeId, x.layerFraction, x.estimatedBytes)));
+  expect(b.tensorOverrides, a.tensorOverrides);
 }
 
 /// Parses `blk\.(a|b|...)\.ffn_.*_exps\.=DEVICE` rules into contiguous ranges.
