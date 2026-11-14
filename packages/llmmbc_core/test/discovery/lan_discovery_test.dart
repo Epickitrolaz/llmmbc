@@ -13,6 +13,34 @@ class FakeClock {
   void advance(Duration d) => now = now.add(d);
 }
 
+/// Number of socket FDs held by this isolate's process (Linux only).
+int socketFdCount() {
+  var count = 0;
+  for (final entity in Directory('/proc/self/fd').listSync()) {
+    try {
+      if (Link(entity.path).targetSync().startsWith('socket:')) count++;
+    } on FileSystemException {
+      // FD closed while listing.
+    }
+  }
+  return count;
+}
+
+/// ESTABLISHED TCP connections involving [port] (Linux only).
+int establishedForPort(int port) {
+  final file = File('/proc/net/tcp');
+  if (!file.existsSync()) return 0;
+  var count = 0;
+  for (final line in file.readAsLinesSync().skip(1)) {
+    final fields = line.trim().split(RegExp(r'\s+'));
+    if (fields.length < 4 || fields[3] != '01') continue; // 01 = ESTABLISHED
+    final localPort = int.parse(fields[1].split(':').last, radix: 16);
+    final remotePort = int.parse(fields[2].split(':').last, radix: 16);
+    if (localPort == port || remotePort == port) count++;
+  }
+  return count;
+}
+
 Future<void> waitFor(bool Function() condition,
     {Duration timeout = const Duration(seconds: 10)}) async {
   final deadline = DateTime.now().add(timeout);
@@ -367,6 +395,92 @@ void main() {
       await discovery.debugWaitForProbes();
       expect(discovery.peers, hasLength(10));
       expect(discovery.peers.every((p) => p.reachable), isTrue);
+    });
+
+    test('a timed-out probe aborts its socket: no FD or ESTABLISHED growth (#75)',
+        () async {
+      if (!Platform.isLinux) {
+        markTestSkipped('FD/socket introspection needs /proc (Linux)');
+        return;
+      }
+      // A listening socket that never accepts: the kernel completes the TCP
+      // handshake, the process never answers GET /v1/node (a stalled peer).
+      final server = await ServerSocket.bind(
+          InternetAddress.loopbackIPv4, 0,
+          backlog: 128);
+      addTearDown(() => server.close());
+
+      final clock = FakeClock(DateTime(2025, 1, 1));
+      final discovery = LanDiscovery(
+        client: HttpNodeClient(timeout: const Duration(milliseconds: 250)),
+        sweepEnabled: false,
+        now: () => clock.now,
+        probeTimeout: const Duration(milliseconds: 250),
+      );
+      addTearDown(discovery.stop);
+      await discovery.start(
+        () => nodeInfo('self'),
+        const NodeSettings(
+            nodeId: 'self', name: 'self', dataDir: '/tmp/d', apiPort: 47101),
+      );
+      discovery.debugSeedPeer(
+          nodeInfo('stalled', host: '127.0.0.1', apiPort: server.port),
+          lastSeen: clock.now);
+
+      Future<void> cycle() async {
+        clock.advance(const Duration(seconds: 5));
+        await discovery.debugRunMaintenanceAsync();
+        await Future<void>.delayed(const Duration(milliseconds: 60));
+      }
+
+      // Baseline after one timed-out probe so transient startup FDs settle.
+      await cycle();
+      final baselineFds = socketFdCount();
+      for (var i = 0; i < 8; i++) {
+        await cycle();
+      }
+      expect(discovery.peers.single.reachable, isFalse);
+      await Future<void>.delayed(const Duration(milliseconds: 250));
+
+      expect(socketFdCount() - baselineFds, lessThanOrEqualTo(2),
+          reason: 'every timed-out probe must close its own socket (#75)');
+      expect(establishedForPort(server.port), 0,
+          reason: 'no ESTABLISHED liveness connection may be left behind');
+    });
+
+    test('maintenance retries an unresolved manual peer without scan() (#76)',
+        () async {
+      final clock = FakeClock(DateTime(2025, 1, 1));
+      final client = FakeNodeClient(); // the manual peer is not up yet
+      final discovery = LanDiscovery(
+        client: client,
+        sweepEnabled: false,
+        now: () => clock.now,
+      );
+      addTearDown(discovery.stop);
+      await discovery.start(
+        () => nodeInfo('self'),
+        const NodeSettings(
+            nodeId: 'self',
+            name: 'self',
+            dataDir: '/tmp/d',
+            apiPort: 47101,
+            manualPeers: ['127.0.0.1:49999']),
+      );
+      expect(discovery.peers, isEmpty);
+      final callsAfterStartup = client.infoCalls;
+
+      // The backoff prevents a second attempt on the next maintenance tick.
+      clock.advance(const Duration(seconds: 1));
+      await discovery.debugRunMaintenanceAsync();
+      expect(client.infoCalls, callsAfterStartup);
+
+      // The peer starts later; only the maintenance loop may find it.
+      client.infoByPort[49999] =
+          nodeInfo('late', name: 'late', apiPort: 49999);
+      clock.advance(const Duration(seconds: 15));
+      await discovery.debugRunMaintenanceAsync();
+      expect(discovery.peers.map((p) => p.nodeId), contains('late'));
     });
   });
 
