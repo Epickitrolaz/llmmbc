@@ -38,7 +38,8 @@ ChatErrorInfo describeChatError(Object error) {
           title: 'Model does not fit in the cluster',
           message:
               'The combined memory the cluster can lend is smaller than this model. '
-              '${error.message}',
+              'For MoE models, turn on "Allow MoE models larger than cluster memory" in Settings so '
+              'expert weights stream from the workers\' disks instead. ${error.message}',
         );
       case 'engine_error':
         return ChatErrorInfo(

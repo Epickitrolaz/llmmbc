@@ -231,7 +231,7 @@ class _ClusterScreenState extends State<ClusterScreen> {
                                   child: CircularProgressIndicator(strokeWidth: 2),
                                 )
                               : const Icon(Icons.wifi_find, size: 16),
-                          label: Text(_scanning ? 'Scanning…' : 'Refresh'),
+                          label: Text(_scanning ? 'Scanning…' : 'Rescan network'),
                         ),
                         OutlinedButton.icon(
                           key: const Key('cluster-add-peer'),
@@ -250,11 +250,19 @@ class _ClusterScreenState extends State<ClusterScreen> {
                             compact: true,
                           )
                         : Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
                               for (var i = 0; i < peers.length; i++) ...[
                                 _PeerRow(peer: peers[i], session: _session),
                                 if (i != peers.length - 1) const Divider(height: 16),
                               ],
+                              const SizedBox(height: 10),
+                              Text(
+                                'Updates live from discovery; Rescan network runs a full subnet sweep.',
+                                key: const Key('cluster-live-copy'),
+                                style: theme.textTheme.bodySmall
+                                    ?.copyWith(color: scheme.onSurfaceVariant),
+                              ),
                             ],
                           ),
                   ),
@@ -336,7 +344,13 @@ class _PeerRow extends StatelessWidget {
                       label: '${formatBytes(peer.effectiveBudgetBytes)} budget',
                       icon: Icons.memory,
                     ),
-                    MetaChip(label: formatRelativeTime(peer.lastSeen), icon: Icons.schedule),
+                    MetaChip(
+                      key: Key('peer-last-seen-${peer.nodeId}'),
+                      label: peer.reachable
+                          ? formatRelativeTime(peer.lastSeen)
+                          : 'last seen ${formatRelativeTime(peer.lastSeen)}',
+                      icon: Icons.schedule,
+                    ),
                   ],
                 ),
                 const SizedBox(height: 5),

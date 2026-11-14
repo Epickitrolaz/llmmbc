@@ -325,6 +325,13 @@ class AppSession extends ChangeNotifier {
     await updateSettings(_service.settings.copyWith(memoryBasis: basis));
   }
 
+  /// Opt-in MoE expert streaming (docs/ARCHITECTURE.md §2.4); applies when this
+  /// node coordinates and is persisted with the rest of [NodeSettings].
+  Future<void> setExpertStreaming(bool enabled) async {
+    if (enabled == _service.settings.allowExpertStreaming) return;
+    await updateSettings(_service.settings.copyWith(allowExpertStreaming: enabled));
+  }
+
   /// Bytes this node advertises to the cluster (docs/ARCHITECTURE.md §2.5).
   int get memoryBudgetBytes =>
       _service.hardware.memoryBudgetBytes(_service.settings.memoryBasis, _service.settings.memoryShare);

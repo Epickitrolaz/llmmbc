@@ -13,6 +13,7 @@ import '../app/theme.dart';
 import '../models/conversation.dart';
 import '../util/errors.dart';
 import '../util/format.dart';
+import '../util/model_fit.dart';
 import 'widgets/common.dart';
 
 class ChatScreen extends StatefulWidget {
@@ -145,7 +146,11 @@ class _ChatScreenState extends State<ChatScreen> {
     final selected = await showModalBottomSheet<ModelRef>(
       context: context,
       showDragHandle: true,
-      builder: (context) => _ModelPickerSheet(models: models, selected: _effectiveModel),
+      builder: (context) => _ModelPickerSheet(
+        models: models,
+        selected: _effectiveModel,
+        streamingEnabled: _session.service.settings.allowExpertStreaming,
+      ),
     );
     if (selected == null || !mounted) return;
     setState(() {
@@ -274,6 +279,7 @@ class _ChatScreenState extends State<ChatScreen> {
             children: [
               _ModelBar(
                 model: model,
+                streamingEnabled: _session.service.settings.allowExpertStreaming,
                 onPick: _pickModel,
                 onNewChat: _startNewChat,
                 onToggleHistory: () => setState(() => _showHistory = !_showHistory),
@@ -346,6 +352,7 @@ class _ChatScreenState extends State<ChatScreen> {
 class _ModelBar extends StatelessWidget {
   const _ModelBar({
     required this.model,
+    required this.streamingEnabled,
     required this.onPick,
     required this.onNewChat,
     required this.onToggleHistory,
@@ -353,6 +360,7 @@ class _ModelBar extends StatelessWidget {
   });
 
   final ClusterModel? model;
+  final bool streamingEnabled;
   final VoidCallback onPick;
   final VoidCallback onNewChat;
   final VoidCallback onToggleHistory;
@@ -366,6 +374,8 @@ class _ModelBar extends StatelessWidget {
     final memory = selected == null
         ? 0
         : selected.candidates.fold<int>(0, (sum, node) => sum + node.effectiveBudgetBytes);
+    final fit = selected == null ? null : estimateModelFit(selected);
+    final hint = fit == null ? null : _fitHint(fit, streamingEnabled, key: const Key('chat-model-fit'));
     return Material(
       color: scheme.surface,
       shape: RoundedRectangleBorder(
@@ -446,6 +456,7 @@ class _ModelBar extends StatelessWidget {
                             icon: Icons.hub_outlined,
                           ),
                           MetaChip(label: '${formatBytes(memory)} cluster budget', icon: Icons.memory),
+                          ?hint,
                         ],
                       ),
               ),
@@ -858,10 +869,15 @@ class _Composer extends StatelessWidget {
 }
 
 class _ModelPickerSheet extends StatelessWidget {
-  const _ModelPickerSheet({required this.models, required this.selected});
+  const _ModelPickerSheet({
+    required this.models,
+    required this.selected,
+    required this.streamingEnabled,
+  });
 
   final List<ClusterModel> models;
   final ModelRef? selected;
+  final bool streamingEnabled;
 
   @override
   Widget build(BuildContext context) {
@@ -892,6 +908,8 @@ class _ModelPickerSheet extends StatelessWidget {
                     0,
                     (sum, node) => sum + node.effectiveBudgetBytes,
                   );
+                  final fit = estimateModelFit(model);
+                  final hint = _fitHint(fit, streamingEnabled, key: Key('model-fit-${model.ref}'));
                   return ListTile(
                     key: Key('model-option-${model.ref}'),
                     contentPadding: EdgeInsets.zero,
@@ -913,10 +931,19 @@ class _ModelPickerSheet extends StatelessWidget {
                         ModelKindBadge(isMoe: model.isMoe),
                       ],
                     ),
-                    subtitle: Text(
-                      '${formatBytes(model.sizeBytes)} · ${pluralize(model.candidates.length, 'candidate')} · '
-                      '${formatBytes(memory)} budget',
-                      style: theme.textTheme.bodySmall,
+                    subtitle: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          '${formatBytes(model.sizeBytes)} · ${pluralize(model.candidates.length, 'candidate')} · '
+                          '${formatBytes(memory)} budget',
+                          style: theme.textTheme.bodySmall,
+                        ),
+                        if (hint != null) ...[
+                          const SizedBox(height: 4),
+                          hint,
+                        ],
+                      ],
                     ),
                     trailing: active ? Icon(Icons.check, color: scheme.primary) : null,
                     onTap: () => Navigator.of(context).pop(model.ref),
@@ -926,6 +953,56 @@ class _ModelPickerSheet extends StatelessWidget {
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+/// Streaming hint/badge for a cluster model; null when the model fits or has no
+/// usable candidate budget to compare against.
+Widget? _fitHint(ModelFit fit, bool streamingEnabled, {Key? key}) {
+  if (!fit.hasCandidates || fit.state == FitState.fits) return null;
+  return _FitHint(key: key, fit: fit, streamingEnabled: streamingEnabled);
+}
+
+class _FitHint extends StatelessWidget {
+  const _FitHint({super.key, required this.fit, required this.streamingEnabled});
+
+  final ModelFit fit;
+  final bool streamingEnabled;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final (label, icon, color) = switch (fit.state) {
+      FitState.fits => ('', Icons.check, scheme.primary),
+      FitState.needsExpertStreaming => streamingEnabled
+          ? ('streams from disk, slower', Icons.sd_storage_outlined, scheme.secondary)
+          : ('Needs expert streaming (Settings)', Icons.settings_outlined, scheme.tertiary),
+      FitState.doesNotFit => ('Does not fit in cluster memory', Icons.error_outline, scheme.error),
+    };
+    if (fit.state == FitState.fits) return const SizedBox.shrink();
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.10),
+        borderRadius: BorderRadius.circular(7),
+        border: Border.all(color: color.withValues(alpha: 0.35)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 12, color: color),
+          const SizedBox(width: 4),
+          Flexible(
+            child: Text(
+              label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: color),
+            ),
+          ),
+        ],
       ),
     );
   }

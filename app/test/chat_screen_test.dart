@@ -1,3 +1,4 @@
+import 'package:app/dev/fake_node_service.dart';
 import 'package:app/services/degraded_node_service.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -93,6 +94,40 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('granite3.1-moe:1b'), findsWidgets);
+  });
+
+  testWidgets('picker points a too-large MoE at expert streaming, then badges it once enabled', (tester) async {
+    // Peers lend 3 GiB: the 18 GiB Qwen3 MoE no longer fits, but its ~1.8 GiB
+    // of non-expert tensors still do, so streaming is the only way to run it.
+    final session = await testSessionWith(
+      FakeNodeService(peerBudgetOverride: 3 * 1024 * 1024 * 1024),
+    );
+    await pumpApp(tester, session);
+
+    await tester.tap(find.byKey(const Key('chat-model-picker')));
+    await tester.pumpAndSettle();
+
+    expect(find.byKey(const Key('model-fit-qwen3:30b-a3b')), findsOneWidget);
+    expect(find.text('Needs expert streaming (Settings)'), findsWidgets);
+    // A model that still fits gets no hint.
+    expect(find.byKey(const Key('model-fit-granite3.1-moe:1b')), findsNothing);
+
+    // Close the sheet, switch the setting on and inspect the badge.
+    await tester.tap(find.byKey(const Key('model-option-granite3.1-moe:1b')));
+    await tester.pumpAndSettle();
+    await session.setExpertStreaming(true);
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byKey(const Key('chat-model-picker')));
+    await tester.pumpAndSettle();
+    expect(find.text('streams from disk, slower'), findsWidgets);
+    expect(find.text('Needs expert streaming (Settings)'), findsNothing);
+
+    // Select it: the compact model bar carries the same badge.
+    await tester.tap(find.byKey(const Key('model-option-qwen3:30b-a3b')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('chat-model-fit')), findsOneWidget);
+    expect(find.text('streams from disk, slower'), findsOneWidget);
   });
 
   testWidgets('empty cluster explains what to do', (tester) async {

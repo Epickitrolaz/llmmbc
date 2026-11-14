@@ -23,6 +23,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _hydrated = false;
   double _share = kDefaultMemoryShare;
   MemoryBasis _basis = MemoryBasis.total;
+  bool _expertStreaming = false;
   List<String> _logLines = const [];
   String? _peerError;
 
@@ -36,6 +37,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       _name.text = settings.name;
       _share = settings.memoryShare;
       _basis = settings.memoryBasis;
+      _expertStreaming = settings.allowExpertStreaming;
       _logLines = _session.service.engine.logTail;
     }
   }
@@ -306,6 +308,52 @@ class _SettingsScreenState extends State<SettingsScreen> {
                                 '(${formatBytes(hardware.availableRamBytes)}) minus the safety reserve, plus VRAM. '
                                 'The cluster planner never assigns more than this budget.',
                         style: theme.textTheme.bodySmall?.copyWith(color: scheme.onSurfaceVariant),
+                      ),
+                      const SizedBox(height: 16),
+                      Divider(color: scheme.outlineVariant.withValues(alpha: 0.5)),
+                      const SizedBox(height: 8),
+                      Container(
+                        decoration: BoxDecoration(
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(color: scheme.outlineVariant.withValues(alpha: 0.6)),
+                        ),
+                        child: SwitchListTile.adaptive(
+                          key: const Key('expert-streaming-toggle'),
+                          value: _expertStreaming,
+                          onChanged: (value) async {
+                            setState(() => _expertStreaming = value);
+                            await _session.setExpertStreaming(value);
+                            if (!mounted) return;
+                            setState(() => _expertStreaming = _session.service.settings.allowExpertStreaming);
+                          },
+                          title: Wrap(
+                            spacing: 8,
+                            runSpacing: 4,
+                            crossAxisAlignment: WrapCrossAlignment.center,
+                            children: [
+                              Text(
+                                'Allow MoE models larger than cluster memory',
+                                style: theme.textTheme.titleSmall,
+                              ),
+                              StatusPill(
+                                label: _expertStreaming ? 'ON' : 'OFF',
+                                color: _expertStreaming ? scheme.primary : scheme.onSurfaceVariant,
+                              ),
+                            ],
+                          ),
+                          subtitle: Text(
+                            'Expert weights stream from each worker\'s own storage, so models larger than '
+                            'the cluster\'s RAM can run — at reduced speed (often ~1 token/s or less on phones '
+                            'until hot experts are cached). Applies when this device coordinates. '
+                            'MoE models only.',
+                            key: const Key('expert-streaming-copy'),
+                          ),
+                          isThreeLine: true,
+                          secondary: Icon(
+                            _expertStreaming ? Icons.storage : Icons.sd_storage_outlined,
+                            color: _expertStreaming ? scheme.primary : scheme.onSurfaceVariant,
+                          ),
+                        ),
                       ),
                     ],
                   ),
